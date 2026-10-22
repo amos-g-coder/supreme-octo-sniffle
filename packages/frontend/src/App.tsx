@@ -1,0 +1,289 @@
+import {
+  getErrorMessage,
+  ThemeProvider,
+  TrueForgeUI,
+  useTheme,
+  type AnalyticsConfig,
+  type SlotOverrides,
+  type ThemeConfig,
+} from '@truefoundry/trueforge-ui';
+import {
+  createTrueForgeClient,
+  getCapabilities,
+  listModels,
+  type HarnessAgentSpec,
+} from '@truefoundry/trueforge-ui/plugins/trueforge-agent-server-adapter';
+import posthog from 'posthog-js';
+import { useEffect, useMemo, useState } from 'react';
+import { ThinkingOrb } from 'thinking-orbs';
+import { AuthErrorScreen } from './AuthErrorScreen';
+import { createAuthAwareFetch } from './authFetch';
+import { probeSession, type SessionState } from './authSession';
+import { parseAuthErrorReason, shouldShowAuthErrorScreen, stripAuthErrorSearch } from './authStatusSearch';
+import { GetStartedScreen } from './GetStartedScreen';
+import { InflexMediaPanel } from './InflexMediaPanel';
+import { InflexSignIn } from './InflexSignIn';
+import { LogoutButton } from './LogoutButton';
+import { NewAgentWelcomeScreen } from './NewAgentWelcomeScreen';
+import { API_BASE_URL, uiRouterBasename } from './publicPath';
+import { RegisterSkillsLink } from './RegisterSkillsLink';
+
+const POSTHOG_API_KEY = import.meta.env.VITE_POSTHOG_API_KEY;
+const POSTHOG_HOST = import.meta.env.VITE_POSTHOG_HOST ?? 'https://us.i.posthog.com';
+
+function initAnalytics(): void {
+  if (!POSTHOG_API_KEY) {
+    return;
+  }
+  posthog.init(POSTHOG_API_KEY, {
+    api_host: POSTHOG_HOST,
+    autocapture: false,
+    capture_pageview: false,
+    disable_session_recording: true,
+  });
+}
+
+initAnalytics();
+
+/** Shared cookie/OIDC fetch for boot helpers and `<TrueForgeUI server />`. */
+const authAwareFetch = createAuthAwareFetch();
+// UI + API share the public prefix from `window.__TRUEFORGE_BASE_PATH__`.
+const bootClient = createTrueForgeClient({ baseUrl: API_BASE_URL, fetch: authAwareFetch });
+const routerBasename = uiRouterBasename();
+
+/** Host brand: primary CTA fill is a gradient (see `index.css`); keep solid token for accents. */
+const appTheme: ThemeConfig = {
+  className: 'harness-primary-gradient',
+  brand: {
+    name: 'Inflex',
+    mode: 'icon-title',
+    icon: 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"%3E%3Crect width="32" height="32" rx="8" fill="%236366f1"/%3E%3Cpath d="M10 8h12v4h-4v8h4v4H10v-4h4v-8h-4z" fill="white"/%3E%3C/svg%3E',
+  },
+  tokens: {
+    primaryButtonBg: '#6366F1',
+    primaryButtonHover: '#3d2dd4',
+  },
+};
+
+function Loader() {
+  const { mode } = useTheme();
+  return (
+    <div className="boot-screen" role="status" aria-label="Loading" aria-live="polite" aria-busy="true">
+      <ThinkingOrb
+        state="connecting"
+        speed={1}
+        theme={mode}
+        paused={false}
+        aria-hidden
+        size={64}
+        style={{ width: '4.5rem', height: '4.5rem' }}
+      />
+    </div>
+  );
+}
+
+type BootState =
+  | { status: 'loading' }
+  | { status: 'error'; message: string }
+  | { status: 'ready'; defaultAgentSpec: HarnessAgentSpec; openSettings: boolean };
+
+export function App() {
+  useEffect(() => {
+    document.title = 'Inflex';
+  }, []);
+  const authError = parseAuthErrorReason(window.location.search);
+  const [session, setSession] = useState<SessionState | { status: 'checking' }>({ status: 'checking' });
+  const [boot, setBoot] = useState<BootState>({ status: 'loading' });
+
+  // Gate boot on a non-redirecting `/me` probe: unauthenticated users see the
+  // welcome screen instead of being bounced to login by the auth-aware fetch.
+  // Probe even when the URL has `?error=` — a replayed callback can leave that
+  // query on a session that is still valid.
+  useEffect(() => {
+    const state = { cancelled: false };
+    void probeSession().then(result => {
+      if (!state.cancelled) {
+        setSession(result);
+      }
+    });
+    return () => {
+      state.cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (session.status !== 'authenticated') {
+      return;
+    }
+    if (parseAuthErrorReason(window.location.search) == null) {
+      return;
+    }
+    window.history.replaceState(
+      window.history.state,
+      '',
+      stripAuthErrorSearch({
+        pathname: window.location.pathname,
+        search: window.location.search,
+        hash: window.location.hash,
+      }),
+    );
+  }, [session]);
+
+  useEffect(() => {
+    if (session.status !== 'authenticated') {
+      return;
+    }
+    const state = { cancelled: false };
+    void (async () => {
+      try {
+        const [models, capabilities] = await Promise.all([listModels(bootClient), getCapabilities(bootClient)]);
+        if (state.cancelled) {
+          return;
+        }
+        const first = models.find(model => model.name.startsWith('chatgpt/'));
+        const sandboxConfig: HarnessAgentSpec['config'] = {
+          inflex: { goal_mode: 'standard', thinking_tier: 'balanced' },
+          sandbox: { enabled: false },
+        };
+        if (first === undefined) {
+          setBoot({
+            status: 'ready',
+            openSettings: capabilities.settings.enabled,
+            defaultAgentSpec: {
+              model: { name: '' },
+              config: sandboxConfig,
+            },
+          });
+          return;
+        }
+        const reasoningEfforts = first.properties.reasoningEfforts;
+        // Default to "medium"; catalog lists are ordered ascending, so otherwise the lowest real effort, not "none".
+        const defaultReasoningEffort =
+          reasoningEfforts?.find(effort => effort === 'medium') ??
+          reasoningEfforts?.find(effort => effort !== 'none') ??
+          reasoningEfforts?.[0];
+        setBoot({
+          status: 'ready',
+          openSettings: false,
+          defaultAgentSpec: {
+            model: {
+              name: first.name,
+              ...(defaultReasoningEffort ? { params: { reasoningEffort: defaultReasoningEffort } } : {}),
+            },
+            config: sandboxConfig,
+          },
+        });
+      } catch (err) {
+        if (!state.cancelled) {
+          setBoot({
+            status: 'error',
+            message: getErrorMessage(err, 'Failed to boot'),
+          });
+        }
+      }
+    })();
+    return () => {
+      state.cancelled = true;
+    };
+  }, [session]);
+
+  const overrides: SlotOverrides = useMemo(
+    () => ({
+      ShellActionsActionSlot: LogoutButton,
+      WelcomeScreen: NewAgentWelcomeScreen,
+      AgentSkillsHeaderActionSlot: RegisterSkillsLink,
+    }),
+    [],
+  );
+
+  const hostAnalytics = useMemo((): AnalyticsConfig | undefined => {
+    if (!POSTHOG_API_KEY || session.status !== 'authenticated') {
+      return undefined;
+    }
+    const { tenantId } = session;
+    return {
+      track: (eventName, data) => {
+        posthog.capture(eventName, {
+          tenant: tenantId,
+          ...data,
+        });
+      },
+    };
+  }, [session]);
+
+  const authErrorReason = shouldShowAuthErrorScreen({ authError, session });
+  if (authErrorReason != null) {
+    return (
+      <ThemeProvider theme={appTheme}>
+        <AuthErrorScreen reason={authErrorReason} />
+      </ThemeProvider>
+    );
+  }
+
+  if (session.status === 'checking') {
+    return (
+      <ThemeProvider theme={appTheme}>
+        <Loader />
+      </ThemeProvider>
+    );
+  }
+
+  if (session.status === 'unauthenticated') {
+    return (
+      <ThemeProvider theme={appTheme}>
+        <GetStartedScreen />
+      </ThemeProvider>
+    );
+  }
+
+  if (boot.status === 'error') {
+    return (
+      <ThemeProvider theme={appTheme}>
+        <div className="boot-screen" data-error="true">
+          Failed to load application configuration: {boot.message}
+        </div>
+      </ThemeProvider>
+    );
+  }
+
+  if (boot.status === 'loading') {
+    return (
+      <ThemeProvider theme={appTheme}>
+        <Loader />
+      </ThemeProvider>
+    );
+  }
+
+  if (!boot.defaultAgentSpec.model.name) {
+    return (
+      <ThemeProvider theme={appTheme}>
+        <InflexSignIn />
+      </ThemeProvider>
+    );
+  }
+  return (
+    <div className="app-root">
+      <InflexMediaPanel />
+      <TrueForgeUI
+        server={{
+          type: 'trueforge',
+          baseUrl: API_BASE_URL,
+          fetch: authAwareFetch,
+        }}
+        layout="sidebar"
+        withRouter
+        {...(routerBasename ? { routes: { basename: routerBasename } } : {})}
+        agentConfig={{
+          mode: 'AgentLibraryWithComposer',
+          defaultAgentSpec: boot.defaultAgentSpec,
+        }}
+        initialSettingsOpen={boot.openSettings}
+        currentUser={{ subjectId: session.subjectId, displayName: session.displayName }}
+        overrides={overrides}
+        theme={appTheme}
+        className="app-assistant"
+        {...(hostAnalytics ? { analytics: hostAnalytics } : {})}
+      />
+    </div>
+  );
+}

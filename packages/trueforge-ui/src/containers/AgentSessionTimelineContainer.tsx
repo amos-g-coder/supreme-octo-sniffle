@@ -1,0 +1,366 @@
+'use client';
+
+import { ThreadPrimitive, useAuiState, type ThreadMessageLike } from '@assistant-ui/react';
+import { convertTurnsToThreadMessages, isMcpServerAuthInfoList } from '@truefoundry/trueforge-assistant-ui-runtime';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
+
+import { AssistantMessageBubble, type AssistantMessageBubbleProps } from '../atoms/AssistantMessageBubble.js';
+import { Markdown, type MarkdownProps } from '../atoms/Markdown.js';
+import { MessageActionBar } from '../atoms/MessageActionBar.js';
+import { ToolApprovalBar, type ToolApprovalBarProps } from '../atoms/ToolApprovalBar.js';
+import { ToolCallCard, type ToolCallCardProps } from '../atoms/ToolCallCard.js';
+import type { UserMessageActionBarProps } from '../atoms/UserMessageActionBar.js';
+import { useServer } from '../server/ServerContext.js';
+import type { AgentChatServer, SessionEventItem } from '../server/types.js';
+import type { SlotOverrides } from '../theme/SlotsProvider.js';
+import { useSlot } from '../theme/SlotsProvider.js';
+import { buildSessionMetrics } from '../utils/buildSessionMetrics.js';
+import { buildSessionTimelineSegments } from '../utils/buildSessionTimelineSegments.js';
+import { createCachedListEventsBridge } from '../utils/cachedListEventsBridge.js';
+import { getTurnInputSummary } from '../utils/sessionTimelineEvents.js';
+import { aggregateSessionTurnBand, buildSessionTurnViews, type SessionTurnView } from '../utils/sessionTurnViews.js';
+import { AssistantMessageContainer } from './AssistantMessageContainer.js';
+import { ReadOnlySessionTurnRuntime } from './ReadOnlySessionTurnRuntime.js';
+import { UserMessageContainer } from './UserMessageContainer.js';
+
+function ReadOnlyMarkdown(props: MarkdownProps) {
+  return (
+    <Markdown
+      {...props}
+      readOnly
+      onDownloadArtifact={undefined}
+      sandboxDownloadReadOnlyTooltip="Download File is not available in read-only mode"
+    />
+  );
+}
+
+/** Copy + timestamp only — edit/retry are not meaningful in session details. */
+function ReadOnlyUserMessageActionBar({ isCopied, onCopy, createdAt, className }: UserMessageActionBarProps) {
+  return <MessageActionBar isCopied={isCopied} onCopy={onCopy} createdAt={createdAt} className={className} />;
+}
+
+/** HITL Allow/Deny is only for live chat — session detail is a historical replay. */
+function ReadOnlyToolApprovalBar(props: ToolApprovalBarProps) {
+  return <ToolApprovalBar {...props} readOnly />;
+}
+
+/** Nothing will answer a paused approval in a replay, so drop the "Awaiting Response" spinner. */
+function ReadOnlyToolCallCard(props: ToolCallCardProps) {
+  return <ToolCallCard {...props} awaiting={props.approvalSlot ? false : props.awaiting} />;
+}
+
+/** In session detail replay, render any pending MCP authorization prompt in readOnly mode. */
+function ReadOnlyAssistantMessageBubble(props: AssistantMessageBubbleProps) {
+  const McpAuthPrompt = useSlot('McpAuthPrompt');
+  const custom = useAuiState(s => s.message.metadata.custom);
+  const rawServers = custom?.pendingMcpAuth === true ? custom?.mcpServers : undefined;
+  const mcpServers = isMcpServerAuthInfoList(rawServers) ? rawServers : undefined;
+
+  return (
+    <AssistantMessageBubble {...props}>
+      {props.children}
+      {mcpServers != null && mcpServers.length > 0 ? (
+        <McpAuthPrompt servers={mcpServers} readOnly={true} onConnect={() => {}} />
+      ) : null}
+    </AssistantMessageBubble>
+  );
+}
+
+const READ_ONLY_SLOT_OVERRIDES: SlotOverrides = {
+  AssistantMessageBubble: ReadOnlyAssistantMessageBubble,
+  UserMessageActionBar: ReadOnlyUserMessageActionBar,
+  Markdown: ReadOnlyMarkdown,
+  ToolApprovalBar: ReadOnlyToolApprovalBar,
+  ToolCallCard: ReadOnlyToolCallCard,
+};
+
+type TurnCreatedEvent = Extract<SessionEventItem['event'], { type: 'turn.created' }>;
+type UserMessageInput = Extract<NonNullable<TurnCreatedEvent['input']>[number], { type: 'user.message' }>;
+
+function turnIdFromMessage(message: ThreadMessageLike): string {
+  const messageId = message.id ?? '';
+  // The stable message id identifies the opening backend turn. Metadata can
+  // point at the latest continuation turn for artifact ownership.
+  return message.role === 'user' ? messageId.replace(/-user$/, '') : messageId.replace(/-assistant$/, '');
+}
+
+function buildProjectionEvents(items: SessionEventItem[], turns: SessionTurnView[]): SessionEventItem[] {
+  // The chat projection folds continuation inputs into the previous response.
+  // Add a display-only user boundary so Agent Details keeps each backend turn separate.
+  const continuationSummaries = new Map(
+    turns.flatMap(turn => {
+      const input = turn.created.input ?? [];
+      return input.some(item => item.type === 'user.message') ? [] : [[turn.turnId, getTurnInputSummary(turn)]];
+    }),
+  );
+
+  return items.map(item => {
+    if (item.event.type !== 'turn.created') return item;
+    const summary = continuationSummaries.get(item.turnId);
+    if (summary === undefined) return item;
+    const displayInput: UserMessageInput = { type: 'user.message', content: summary };
+    return {
+      ...item,
+      event: {
+        ...item.event,
+        input: [...(item.event.input ?? []), displayInput],
+      },
+    };
+  });
+}
+
+/** Retrieves MCP servers requiring OAuth in this turn from done actions or turn events. */
+function findTurnMcpServers(turn: SessionTurnView) {
+  const actions = turn.done?.state.status === 'done' ? turn.done.state.requiredActions : undefined;
+  if (Array.isArray(actions)) {
+    for (const action of actions) {
+      if (action.type === 'mcp.auth_required' && isMcpServerAuthInfoList(action.mcpServers)) {
+        return action.mcpServers;
+      }
+    }
+  }
+  for (const event of turn.events) {
+    if (event.type === 'mcp.auth_required' && isMcpServerAuthInfoList(event.mcpServers)) {
+      return event.mcpServers;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Re-attaches MCP auth metadata to the assistant message in session replay.
+ * History projection drops pendingMcpAuth when synthetic continuation user messages
+ * follow; restoring it here ensures ReadOnlyAssistantMessageBubble renders the auth widget.
+ */
+function applyMcpAuthState(messages: ThreadMessageLike[], turn: SessionTurnView): ThreadMessageLike[] {
+  const mcpServers = findTurnMcpServers(turn);
+  if (mcpServers == null || mcpServers.length === 0) return messages;
+
+  const assistantIndex = messages.findIndex(message => message.role === 'assistant');
+  const assistant = assistantIndex < 0 ? undefined : messages[assistantIndex];
+  const createdAt = new Date(turn.done?.createdAt ?? turn.created.createdAt);
+  const updatedAssistant: ThreadMessageLike = {
+    ...(assistant ?? {
+      id: `${turn.turnId}-assistant`,
+      role: 'assistant',
+      content: [],
+      createdAt,
+    }),
+    ...(turn.done?.state.status === 'done' ? { status: { type: 'complete', reason: 'stop' } } : {}),
+    metadata: {
+      ...assistant?.metadata,
+      custom: {
+        ...assistant?.metadata?.custom,
+        turnId: turn.turnId,
+        pendingMcpAuth: true,
+        mcpServers,
+      },
+    },
+  };
+
+  if (assistantIndex < 0) return [...messages, updatedAssistant];
+  return messages.map((message, index) => (index === assistantIndex ? updatedAssistant : message));
+}
+
+function messageBelongsToTurn(message: ThreadMessageLike, turnId: string): boolean {
+  if (turnIdFromMessage(message) === turnId) return true;
+  // Folded continuations keep `${openingTurnId}-assistant` but stamp the cancelling
+  // turn id on metadata.custom.turnId so the banner lands on the right section.
+  const customTurnId = message.metadata?.custom?.['turnId'];
+  return typeof customTurnId === 'string' && customTurnId === turnId;
+}
+
+function messagesForTurn(messages: ThreadMessageLike[], turn: SessionTurnView): ThreadMessageLike[] {
+  const matched = messages.filter(message => messageBelongsToTurn(message, turn.turnId));
+  return applyMcpAuthState(matched, turn);
+}
+
+export type AgentSessionTimelineContainerProps = {
+  sessionId: string;
+  events: SessionEventItem[];
+  contentMaxWidth?: string;
+  sessionMetrics?: {
+    totalTurns?: number;
+    totalCostInUsd?: number;
+    totalDurationMs: number;
+  };
+};
+
+export function AgentSessionTimelineContainer({
+  sessionId,
+  events,
+  contentMaxWidth,
+  sessionMetrics: sessionMetricsHint,
+}: AgentSessionTimelineContainerProps) {
+  const server = useServer();
+  const AgentSessionTurnHeader = useSlot('AgentSessionTurnHeader');
+  const AgentSessionEventTimeline = useSlot('AgentSessionEventTimeline');
+  const AgentSessionMetricsStrip = useSlot('AgentSessionMetricsStrip');
+  const MessageListSkeleton = useSlot('MessageListSkeleton');
+  const ThreadViewportShell = useSlot('ThreadViewportShell');
+
+  const [messages, setMessages] = useState<ThreadMessageLike[]>();
+  const [loadFailed, setLoadFailed] = useState(false);
+  const sectionRefs = useRef(new Map<number, HTMLElement>());
+
+  const allTurnViews = useMemo(() => buildSessionTurnViews(events), [events]);
+  const renderableTurnViews = useMemo(() => allTurnViews.filter(turn => turn.renderable), [allTurnViews]);
+  const projectionEvents = useMemo(
+    () => buildProjectionEvents(events, renderableTurnViews),
+    [events, renderableTurnViews],
+  );
+  const timelineSegments = useMemo(() => buildSessionTimelineSegments(allTurnViews), [allTurnViews]);
+  const sessionMetrics = useMemo(
+    () => buildSessionMetrics({ turns: allTurnViews, segments: timelineSegments, sessionMetrics: sessionMetricsHint }),
+    [sessionMetricsHint, timelineSegments, allTurnViews],
+  );
+
+  const handleSelectTurn = useCallback((index: number) => {
+    sectionRefs.current.get(index)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setMessages(undefined);
+    setLoadFailed(false);
+
+    const bridge = createCachedListEventsBridge(projectionEvents, { allAtOnce: true });
+    // Events already include every turn.created / turn.done, so skip listTurns.
+    const chatServer: AgentChatServer = {
+      ...server,
+      listEvents: req => bridge.listEvents(req),
+      listTurns: async () => ({ data: [] }),
+    };
+
+    void convertTurnsToThreadMessages(chatServer, sessionId)
+      .then(result => {
+        if (!cancelled) setMessages(result.messages);
+      })
+      .catch(() => {
+        if (!cancelled) setLoadFailed(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectionEvents, server, sessionId]);
+
+  if (loadFailed) {
+    return (
+      <div className="flex flex-1 items-center justify-center px-6 text-sm text-text-secondary">
+        Session messages could not be loaded.
+      </div>
+    );
+  }
+
+  if (messages === undefined) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-4">
+        <MessageListSkeleton />
+      </div>
+    );
+  }
+
+  // Running tips are omitted from listEvents (and thus from turn views). Orphan
+  // projected content with no section to attach to must not blank the pane.
+  if (renderableTurnViews.length === 0) {
+    return (
+      <div className="flex flex-1 items-center justify-center px-6 text-sm text-text-secondary">
+        This session has no messages yet.
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain"
+      data-slot="agent-session-scroll"
+    >
+      <div className="sticky top-0 z-20 bg-primary-bg" data-slot="agent-session-metrics-sticky">
+        <AgentSessionMetricsStrip metrics={sessionMetrics} />
+      </div>
+      <div className="border-b border-border">
+        <Suspense fallback={null}>
+          <AgentSessionEventTimeline turns={allTurnViews} segments={timelineSegments} onSelectTurn={handleSelectTurn} />
+        </Suspense>
+      </div>
+      <ThreadViewportShell
+        scrollable={false}
+        className="pb-4"
+        {...(contentMaxWidth == null ? {} : { contentMaxWidth })}
+      >
+        <div className="flex flex-col gap-4">
+          {renderableTurnViews.map(turn => (
+            <SessionTurnSection
+              key={turn.turnId}
+              turn={aggregateSessionTurnBand(allTurnViews, turn.turnNumber) ?? turn}
+              messages={messagesForTurn(messages, turn)}
+              AgentSessionTurnHeader={AgentSessionTurnHeader}
+              onMount={node => {
+                if (node == null) sectionRefs.current.delete(turn.turnNumber - 1);
+                else sectionRefs.current.set(turn.turnNumber - 1, node);
+              }}
+            />
+          ))}
+        </div>
+      </ThreadViewportShell>
+    </div>
+  );
+}
+
+function SessionTurnSection({
+  turn,
+  messages,
+  AgentSessionTurnHeader,
+  onMount,
+}: {
+  turn: SessionTurnView;
+  messages: ThreadMessageLike[];
+  AgentSessionTurnHeader: ComponentType<{
+    turnNumber: number;
+    totalTokens?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedTokens?: number;
+    durationMs?: number;
+    totalCostInUsd?: number;
+  }>;
+  onMount: (node: HTMLElement | null) => void;
+}) {
+  if (!turn.showHeader && messages.length === 0) {
+    return null;
+  }
+
+  return (
+    <section ref={onMount} id={`session-turn-${turn.turnNumber}`} className="flex flex-col gap-2">
+      {turn.showHeader ? (
+        <AgentSessionTurnHeader
+          turnNumber={turn.turnNumber}
+          totalTokens={turn.totalTokens}
+          inputTokens={turn.inputTokens}
+          outputTokens={turn.outputTokens}
+          cachedTokens={turn.cachedTokens}
+          durationMs={turn.durationMs}
+          totalCostInUsd={turn.totalCostInUsd}
+        />
+      ) : null}
+      {messages.length > 0 ? (
+        <ReadOnlySessionTurnRuntime slotOverrides={READ_ONLY_SLOT_OVERRIDES} messages={messages}>
+          <ThreadPrimitive.Root asChild>
+            <div className="aui-root aui-thread-root flex w-full flex-col">
+              <ThreadPrimitive.Messages>
+                {({ message }) => (message.role === 'user' ? <UserMessageContainer /> : <AssistantMessageContainer />)}
+              </ThreadPrimitive.Messages>
+            </div>
+          </ThreadPrimitive.Root>
+        </ReadOnlySessionTurnRuntime>
+      ) : null}
+    </section>
+  );
+}
+
+declare module '../theme/SlotsProvider.js' {
+  interface AtomSlots {
+    AgentSessionTimelineContainer: typeof AgentSessionTimelineContainer;
+  }
+}

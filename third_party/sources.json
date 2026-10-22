@@ -1,0 +1,23 @@
+{
+  "trueforge": {
+    "url": "https://github.com/truefoundry/trueforge",
+    "inspected_commit": "f5427d9116f1ade2c7ec2dc0172e66894a406204"
+  },
+  "cairn": {
+    "url": "https://github.com/oritera/Cairn",
+    "inspected_commit": "8e7e0ea67552383851dfcabfba0c4e9c8d007878"
+  },
+  "hindsight": {
+    "url": "https://github.com/vectorize-io/hindsight",
+    "inspected_commit": "5ecc639c275b8bd3df9f50a29d5cc96965fe8183"
+  },
+  "open-computer-use": {
+    "url": "https://github.com/iFurySt/open-computer-use",
+    "inspected_commit": "43eb4b53de7a15b3f99ec2c9922bedeb95602266"
+  },
+  "framefields": {
+    "url": "https://github.com/gatewai-dev/framefields",
+    "inspected_commit": "213db02f619cac0081e74ff88bcb358773186123",
+    "npm_version": "2.4.0"
+  }
+}

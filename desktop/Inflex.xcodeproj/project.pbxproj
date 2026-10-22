@@ -1,0 +1,60 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+        000000000000000000000029 = { isa = XCRemoteSwiftPackageReference; repositoryURL = "https://github.com/gonzalezreal/swift-markdown-ui"; requirement = { kind = exactVersion; version = 2.4.1; }; };
+        00000000000000000000002A = { isa = XCSwiftPackageProductDependency; package = 000000000000000000000029; productName = MarkdownUI; };
+        00000000000000000000002B = { isa = PBXBuildFile; productRef = 00000000000000000000002A; };
+
+		000000000000000000000064 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/AgentConfiguration.swift; sourceTree = "<group>"; };
+		0000000000000000000000C8 = { isa = PBXBuildFile; fileRef = 000000000000000000000064; };
+		000000000000000000000065 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/AppModel.swift; sourceTree = "<group>"; };
+		0000000000000000000000C9 = { isa = PBXBuildFile; fileRef = 000000000000000000000065; };
+		000000000000000000000066 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/ChatView.swift; sourceTree = "<group>"; };
+		0000000000000000000000CA = { isa = PBXBuildFile; fileRef = 000000000000000000000066; };
+		000000000000000000000067 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/InflexApp.swift; sourceTree = "<group>"; };
+		0000000000000000000000CB = { isa = PBXBuildFile; fileRef = 000000000000000000000067; };
+		000000000000000000000068 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/MediaPanel.swift; sourceTree = "<group>"; };
+		0000000000000000000000CC = { isa = PBXBuildFile; fileRef = 000000000000000000000068; };
+		000000000000000000000069 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/MessageView.swift; sourceTree = "<group>"; };
+		0000000000000000000000CD = { isa = PBXBuildFile; fileRef = 000000000000000000000069; };
+		00000000000000000000006A = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/RootView.swift; sourceTree = "<group>"; };
+		0000000000000000000000CE = { isa = PBXBuildFile; fileRef = 00000000000000000000006A; };
+		00000000000000000000006B = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/RuntimeOwner.swift; sourceTree = "<group>"; };
+		0000000000000000000000CF = { isa = PBXBuildFile; fileRef = 00000000000000000000006B; };
+		00000000000000000000006C = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/SettingsView.swift; sourceTree = "<group>"; };
+		0000000000000000000000D0 = { isa = PBXBuildFile; fileRef = 00000000000000000000006C; };
+		00000000000000000000006D = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/InflexApp/Theme.swift; sourceTree = "<group>"; };
+		0000000000000000000000D1 = { isa = PBXBuildFile; fileRef = 00000000000000000000006D; };
+		000000000000000000000002 = { isa = PBXFileReference; explicitFileType = wrapper.application; path = Inflex.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000003 = { isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = InflexUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000004 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Tests/InflexUITests/InflexUITests.swift; sourceTree = "<group>"; };
+		000000000000000000000005 = { isa = PBXBuildFile; fileRef = 000000000000000000000004; };
+		000000000000000000000006 = { isa = PBXBuildFile; productRef = 000000000000000000000028; };
+		00000000000000000000000A = { isa = PBXGroup; children = (000000000000000000000064, 000000000000000000000065, 000000000000000000000066, 000000000000000000000067, 000000000000000000000068, 000000000000000000000069, 00000000000000000000006A, 00000000000000000000006B, 00000000000000000000006C, 00000000000000000000006D, 000000000000000000000004, 00000000000000000000000B); sourceTree = "<group>"; };
+		00000000000000000000000B = { isa = PBXGroup; children = (000000000000000000000002, 000000000000000000000003); name = Products; sourceTree = "<group>"; };
+		00000000000000000000000C = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (0000000000000000000000C8, 0000000000000000000000C9, 0000000000000000000000CA, 0000000000000000000000CB, 0000000000000000000000CC, 0000000000000000000000CD, 0000000000000000000000CE, 0000000000000000000000CF, 0000000000000000000000D0, 0000000000000000000000D1); runOnlyForDeploymentPostprocessing = 0; };
+		00000000000000000000000D = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000006, 00000000000000000000002B); runOnlyForDeploymentPostprocessing = 0; };
+		00000000000000000000000E = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (000000000000000000000005); runOnlyForDeploymentPostprocessing = 0; };
+		00000000000000000000000F = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		000000000000000000000010 = { isa = PBXContainerItemProxy; containerPortal = 000000000000000000000001; proxyType = 1; remoteGlobalIDString = 000000000000000000000014; remoteInfo = Inflex; };
+		000000000000000000000011 = { isa = PBXTargetDependency; target = 000000000000000000000014; targetProxy = 000000000000000000000010; };
+		000000000000000000000014 = { isa = PBXNativeTarget; buildConfigurationList = 00000000000000000000001F; buildPhases = (00000000000000000000000C, 00000000000000000000000D); buildRules = (); dependencies = (); name = Inflex; packageProductDependencies = (000000000000000000000028, 00000000000000000000002A); productName = Inflex; productReference = 000000000000000000000002; productType = "com.apple.product-type.application"; };
+		000000000000000000000015 = { isa = PBXNativeTarget; buildConfigurationList = 000000000000000000000020; buildPhases = (00000000000000000000000E, 00000000000000000000000F); buildRules = (); dependencies = (000000000000000000000011); name = InflexUITests; productName = InflexUITests; productReference = 000000000000000000000003; productType = "com.apple.product-type.bundle.ui-testing"; };
+		00000000000000000000001E = { isa = XCConfigurationList; buildConfigurations = (000000000000000000000032, 000000000000000000000033); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		00000000000000000000001F = { isa = XCConfigurationList; buildConfigurations = (000000000000000000000034, 000000000000000000000035); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		000000000000000000000020 = { isa = XCConfigurationList; buildConfigurations = (000000000000000000000036, 000000000000000000000037); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		000000000000000000000032 = { isa = XCBuildConfiguration; name = Debug; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; CLANG_ENABLE_MODULES = YES; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Automatic; }; };
+		000000000000000000000033 = { isa = XCBuildConfiguration; name = Release; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; CLANG_ENABLE_MODULES = YES; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Automatic; }; };
+		000000000000000000000034 = { isa = XCBuildConfiguration; name = Debug; buildSettings = { INFOPLIST_FILE = Resources/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = dev.inflex.desktop; PRODUCT_NAME = Inflex; ENABLE_APP_SANDBOX = NO; SWIFT_EMIT_LOC_STRINGS = NO; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; ENABLE_TESTABILITY = YES; }; };
+		000000000000000000000035 = { isa = XCBuildConfiguration; name = Release; buildSettings = { INFOPLIST_FILE = Resources/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = dev.inflex.desktop; PRODUCT_NAME = Inflex; ENABLE_APP_SANDBOX = NO; SWIFT_EMIT_LOC_STRINGS = NO; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; SWIFT_OPTIMIZATION_LEVEL = "-O"; }; };
+		000000000000000000000036 = { isa = XCBuildConfiguration; name = Debug; buildSettings = { GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.inflex.desktop.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; TEST_TARGET_NAME = Inflex; ENABLE_APP_SANDBOX = NO; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; ENABLE_TESTABILITY = YES; }; };
+		000000000000000000000037 = { isa = XCBuildConfiguration; name = Release; buildSettings = { GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = dev.inflex.desktop.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; TEST_TARGET_NAME = Inflex; ENABLE_APP_SANDBOX = NO; SWIFT_OPTIMIZATION_LEVEL = "-O"; }; };
+		000000000000000000000027 = { isa = XCLocalSwiftPackageReference; relativePath = .; };
+		000000000000000000000028 = { isa = XCSwiftPackageProductDependency; package = 000000000000000000000027; productName = InflexClient; };
+		000000000000000000000001 = { isa = PBXProject; attributes = { BuildIndependentTargetsInParallel = YES; LastUpgradeCheck = 1600; TargetAttributes = { 000000000000000000000015 = { TestTargetID = 000000000000000000000014; }; }; }; buildConfigurationList = 00000000000000000000001E; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = 00000000000000000000000A; packageReferences = (000000000000000000000027, 000000000000000000000029); productRefGroup = 00000000000000000000000B; projectDirPath = ""; projectRoot = ""; targets = (000000000000000000000014, 000000000000000000000015); };
+	};
+	rootObject = 000000000000000000000001;
+}

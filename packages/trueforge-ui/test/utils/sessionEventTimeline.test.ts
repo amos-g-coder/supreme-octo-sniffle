@@ -1,0 +1,1176 @@
+import assert from 'node:assert/strict';
+import { describe, it } from 'vitest';
+
+import type { SessionEventItem } from '@/server/types.js';
+import { buildSessionMetrics } from '@/utils/buildSessionMetrics.js';
+import { buildSessionTimelineSegments } from '@/utils/buildSessionTimelineSegments.js';
+import { getSessionEventColor, type SessionEventTimelineSegment } from '@/utils/sessionEventTimeline.js';
+import {
+  buildTimelineAxisTicks,
+  compressInterTurnGaps,
+  formatTimelineAxisDuration,
+  getActiveTimelineMs,
+  getSubAgentHoverGroups,
+  getSubAgentLanes,
+  groupCoincidentTimelineMarkers,
+  groupOverlappingToolCalls,
+  mergeOverlappingSubAgentSegments,
+} from '@/utils/sessionEventTimelineChart.js';
+import { buildSessionTurnViews } from '@/utils/sessionTurnViews.js';
+
+describe('session event colors', () => {
+  it('uses dark overrides when present and otherwise falls back to the base color', () => {
+    assert.equal(getSessionEventColor('model'), '#3b82f6');
+    assert.equal(getSessionEventColor('model', true), '#6366f1');
+    assert.equal(getSessionEventColor('sub_agent', true), '#3f3f46');
+    assert.equal(getSessionEventColor('tool_call', true), '#f59e0b');
+  });
+});
+
+function created({
+  turnId,
+  createdAt,
+  content = 'hello',
+}: {
+  turnId: string;
+  createdAt: string;
+  content?: string;
+}): SessionEventItem {
+  return {
+    turnId,
+    event: {
+      type: 'turn.created',
+      id: `${turnId}-created`,
+      turnId,
+      previousTurnId: null,
+      input: [{ type: 'user.message', content }],
+      state: { status: 'running' },
+      createdAt,
+      threadId: null,
+    },
+  };
+}
+
+function done({
+  turnId,
+  createdAt,
+  status = 'done',
+  reason,
+}: {
+  turnId: string;
+  createdAt: string;
+  status?: 'done' | 'error' | 'cancelled';
+  reason?: string;
+}): SessionEventItem {
+  return {
+    turnId,
+    event: {
+      type: 'turn.done',
+      id: `${turnId}-done`,
+      state:
+        status === 'error'
+          ? { status: 'error', message: 'failed', completedAt: createdAt }
+          : status === 'cancelled'
+            ? {
+                status: 'cancelled',
+                reason: reason ?? 'client-cancelled',
+                completedAt: createdAt,
+              }
+            : { status: 'done', completedAt: createdAt, output: null, requiredActions: [] },
+      createdAt,
+      threadId: null,
+    },
+  };
+}
+
+describe('buildSessionTimelineSegments', () => {
+  it('compresses idle time between turns and keeps per-turn duration', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      done({ turnId: 't1', createdAt: '2026-01-01T00:01:00.000Z' }),
+      created({ turnId: 't2', createdAt: '2026-01-01T00:10:00.000Z', content: 'next' }),
+      done({ turnId: 't2', createdAt: '2026-01-01T00:11:00.000Z' }),
+    ]);
+    const segments = buildSessionTimelineSegments(turns);
+    const users = segments.filter(segment => segment.type === 'user');
+    assert.equal(users[0]?.startMs, 0);
+    assert.equal(users[1]?.startMs, 60_000);
+    const systems = segments.filter(segment => segment.title === 'turn.done');
+    assert.equal(systems[0]?.endMs, 60_000);
+    assert.equal(systems[1]?.endMs, 120_000);
+  });
+
+  it('builds nested sub-agent and overlapping tool-call segments', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'model-1',
+          threadId: 'main',
+          content: 'calling tools',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          toolCalls: [
+            { id: 'call-a', type: 'function', function: { name: 'search', arguments: '{}' } },
+            { id: 'call-b', type: 'function', function: { name: 'lookup', arguments: '{}' } },
+            { id: 'call-sub', type: 'function', function: { name: 'create_sub_agent', arguments: '{}' } },
+          ],
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'thread.created',
+          id: 'thread-1',
+          threadId: 'child',
+          title: 'Researcher',
+          createdAt: '2026-01-01T00:00:01.100Z',
+          agentInfo: { type: 'dynamic', name: 'researcher', input: 'research' },
+          parent: { threadId: 'main', toolCallId: 'call-sub' },
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'tool.response',
+          id: 'resp-a',
+          threadId: 'main',
+          toolCallId: 'call-a',
+          content: 'a',
+          createdAt: '2026-01-01T00:00:03.000Z',
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'tool.response',
+          id: 'resp-b',
+          threadId: 'main',
+          toolCallId: 'call-b',
+          content: 'b',
+          createdAt: '2026-01-01T00:00:02.500Z',
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'thread.done',
+          id: 'thread-done',
+          threadId: 'child',
+          title: 'Researcher',
+          createdAt: '2026-01-01T00:00:04.000Z',
+          state: { status: 'completed' },
+        },
+      },
+      done({ turnId: 't1', createdAt: '2026-01-01T00:00:05.000Z' }),
+    ]);
+
+    const segments = buildSessionTimelineSegments(turns);
+    assert.equal(
+      segments.some(segment => segment.type === 'tool_call' && segment.description === 'search'),
+      true,
+    );
+    assert.equal(
+      segments.some(segment => segment.type === 'tool_call' && segment.description === 'lookup'),
+      true,
+    );
+    assert.equal(
+      segments.some(segment => segment.id.endsWith('call-sub')),
+      false,
+    );
+    assert.deepEqual(
+      segments
+        .filter(segment => segment.type === 'system' && segment.title === 'system.waiting_for_sub_agent')
+        .map(({ description, startMs, endMs, threadId }) => ({ description, startMs, endMs, threadId })),
+      [
+        {
+          description: 'System waiting for sub-agent to start executing',
+          startMs: 1_000,
+          endMs: 1_100,
+          threadId: 'main',
+        },
+      ],
+    );
+    const toolCalls = segments.filter(segment => segment.type === 'tool_call');
+    assert.equal(toolCalls.length, 2);
+    const groups = groupOverlappingToolCalls(toolCalls).filter(group => group.segments.length > 1);
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0]?.segments.length, 2);
+  });
+
+  it('excludes sub-agent thread tool calls from strip Tool calls', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'model-main',
+          threadId: 'main',
+          content: 'root',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          toolCalls: [
+            { id: 'call-main', type: 'function', function: { name: 'search', arguments: '{}' } },
+            { id: 'call-sub', type: 'function', function: { name: 'create_sub_agent', arguments: '{}' } },
+          ],
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'thread.created',
+          id: 'thread-1',
+          threadId: 'child',
+          title: 'Researcher',
+          createdAt: '2026-01-01T00:00:01.100Z',
+          agentInfo: { type: 'dynamic', name: 'researcher', input: 'research' },
+          parent: { threadId: 'main', toolCallId: 'call-sub' },
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'model-child',
+          threadId: 'child',
+          content: 'child work',
+          createdAt: '2026-01-01T00:00:02.000Z',
+          toolCalls: [
+            { id: 'call-child-a', type: 'function', function: { name: 'child_search', arguments: '{}' } },
+            { id: 'call-child-b', type: 'function', function: { name: 'child_fetch', arguments: '{}' } },
+          ],
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'tool.response',
+          id: 'resp-main',
+          threadId: 'main',
+          toolCallId: 'call-main',
+          content: 'ok',
+          createdAt: '2026-01-01T00:00:03.000Z',
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'tool.response',
+          id: 'resp-child-a',
+          threadId: 'child',
+          toolCallId: 'call-child-a',
+          content: 'a',
+          createdAt: '2026-01-01T00:00:03.500Z',
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'tool.response',
+          id: 'resp-child-b',
+          threadId: 'child',
+          toolCallId: 'call-child-b',
+          content: 'b',
+          createdAt: '2026-01-01T00:00:04.000Z',
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'thread.done',
+          id: 'thread-done',
+          threadId: 'child',
+          title: 'Researcher',
+          createdAt: '2026-01-01T00:00:04.500Z',
+          state: { status: 'completed' },
+        },
+      },
+      done({ turnId: 't1', createdAt: '2026-01-01T00:00:05.000Z' }),
+    ]);
+
+    const segments = buildSessionTimelineSegments(turns);
+    assert.equal(segments.filter(segment => segment.type === 'tool_call').length, 3);
+    assert.equal(buildSessionMetrics({ turns, segments }).toolCalls, 1);
+    assert.equal(buildSessionMetrics({ turns, segments }).subAgents, 1);
+  });
+
+  it('counts pending ask-user tool calls waiting on tool.response_required', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'model-1',
+          threadId: 'main',
+          content: '',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          toolCalls: [
+            {
+              id: 'call-ask',
+              type: 'function',
+              function: { name: 'ask_user_question', arguments: '{"question":"clarify?"}' },
+            },
+          ],
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'tool.response_required',
+          id: 'required-1',
+          threadId: 'main',
+          createdAt: '2026-01-01T00:00:01.100Z',
+          toolCalls: [{ id: 'call-ask', sourceEventId: 'model-1' }],
+        },
+      },
+      done({ turnId: 't1', createdAt: '2026-01-01T00:00:01.200Z' }),
+    ]);
+
+    const segments = buildSessionTimelineSegments(turns);
+    const toolCalls = segments.filter(segment => segment.type === 'tool_call');
+    assert.equal(toolCalls.length, 1);
+    assert.equal(toolCalls[0]?.description, 'ask_user_question');
+    assert.equal(toolCalls[0]?.startMs, 1_000);
+    assert.equal(toolCalls[0]?.endMs, 1_100);
+    assert.equal(buildSessionMetrics({ turns, segments }).toolCalls, 1);
+  });
+
+  it('labels deferred MCP meta-tool bars with the underlying tool name', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'model-1',
+          threadId: 'main',
+          content: 'calling deferred tool',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          toolCalls: [
+            {
+              id: 'call-deferred',
+              type: 'function',
+              function: {
+                name: 'call_tool',
+                arguments: JSON.stringify({
+                  mcp_server: 'github',
+                  tool_name: 'search_issues',
+                  input: { q: 'bug' },
+                }),
+              },
+            },
+          ],
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'tool.response',
+          id: 'resp-deferred',
+          threadId: 'main',
+          toolCallId: 'call-deferred',
+          content: 'ok',
+          createdAt: '2026-01-01T00:00:02.000Z',
+        },
+      },
+      done({ turnId: 't1', createdAt: '2026-01-01T00:00:03.000Z' }),
+    ]);
+
+    const segments = buildSessionTimelineSegments(turns);
+    assert.equal(
+      segments.some(
+        segment => segment.type === 'tool_call' && segment.description === 'call_tool: search_issues (github)',
+      ),
+      true,
+    );
+  });
+
+  it('waits only for the first sub-agent in a concurrent batch', () => {
+    const subAgentEvents: SessionEventItem[] = [
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'model-sub-agents',
+          threadId: 'main',
+          content: '',
+          createdAt: '2026-01-01T00:00:00.005Z',
+          toolCalls: ['a', 'b', 'c'].map(id => ({
+            id: `call-${id}`,
+            type: 'function',
+            function: { name: 'create_sub_agent', arguments: '{}' },
+          })),
+        },
+      },
+      ...['a', 'b', 'c'].map((id, index): SessionEventItem => ({
+        turnId: 't1',
+        event: {
+          type: 'thread.created',
+          id: `thread-${id}`,
+          threadId: `child-${id}`,
+          title: `Agent ${id}`,
+          createdAt: `2026-01-01T00:00:00.0${10 + index * 5}Z`,
+          agentInfo: { type: 'dynamic', name: `agent-${id}`, input: id },
+          parent: { threadId: 'main', toolCallId: `call-${id}` },
+        },
+      })),
+      ...['a', 'b', 'c'].map((id, index): SessionEventItem => ({
+        turnId: 't1',
+        event: {
+          type: 'thread.done',
+          id: `thread-${id}-done`,
+          threadId: `child-${id}`,
+          title: `Agent ${id}`,
+          createdAt: `2026-01-01T00:00:00.0${40 + index * 10}Z`,
+          state: { status: 'completed' },
+        },
+      })),
+    ];
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      ...subAgentEvents,
+      done({ turnId: 't1', createdAt: '2026-01-01T00:00:00.070Z' }),
+    ]);
+
+    const segments = buildSessionTimelineSegments(turns);
+    assert.deepEqual(
+      segments
+        .filter(segment => segment.title === 'system.waiting_for_sub_agent')
+        .map(segment => [segment.startMs, segment.endMs]),
+      [[5, 10]],
+    );
+    assert.deepEqual(
+      mergeOverlappingSubAgentSegments(segments.filter(segment => segment.type === 'sub_agent')).map(segment => [
+        segment.startMs,
+        segment.endMs,
+      ]),
+      [[10, 60]],
+    );
+  });
+});
+
+describe('sessionEventTimelineChart helpers', () => {
+  const bars = (items: Array<[number, number, number]>): SessionEventTimelineSegment[] =>
+    items.map(([startMs, endMs, turnIndex], index) => ({
+      id: `s${index}`,
+      type: 'tool_call',
+      title: 'tool.call',
+      description: `s${index}`,
+      startMs,
+      endMs,
+      turnIndex,
+      threadId: 'main',
+    }));
+  const marker = (
+    id: string,
+    type: SessionEventTimelineSegment['type'],
+    startMs: number,
+  ): SessionEventTimelineSegment => ({
+    id,
+    type,
+    title: id,
+    description: id,
+    startMs,
+    endMs: startMs,
+    turnIndex: 0,
+    threadId: 'main',
+    isMarker: true,
+  });
+
+  it('merges overlapping sub-agent bars from the first start through the last end', () => {
+    const selected = mergeOverlappingSubAgentSegments(
+      bars([
+        [10, 40, 0],
+        [15, 50, 0],
+        [20, 60, 0],
+      ]),
+    );
+    assert.deepEqual(
+      selected.map(segment => ({ id: segment.id, startMs: segment.startMs, endMs: segment.endMs })),
+      [{ id: 's0', startMs: 10, endMs: 60 }],
+    );
+  });
+
+  it('scopes each sub-agent tooltip to its merged visible bar', () => {
+    const subAgents = bars([
+      [0, 10, 0],
+      [9, 11, 0],
+      [10.5, 20, 0],
+    ]).map((segment, index): SessionEventTimelineSegment => ({
+      ...segment,
+      type: 'sub_agent',
+      threadId: `child-${index}`,
+    }));
+    const visibleBars = mergeOverlappingSubAgentSegments(subAgents);
+    const groups = getSubAgentHoverGroups({
+      bars: visibleBars,
+      subAgentSegments: subAgents,
+    });
+
+    assert.deepEqual(
+      visibleBars.map(segment => segment.id),
+      ['s0'],
+    );
+    assert.deepEqual(
+      groups.map(group => ({
+        barId: group.barId,
+        startMs: group.startMs,
+        endMs: group.endMs,
+        segments: group.segments.map(segment => segment.id),
+      })),
+      [{ barId: 's0', startMs: 0, endMs: 20, segments: ['s0', 's1', 's2'] }],
+    );
+  });
+
+  it('assigns non-overlapping sub-agent lanes', () => {
+    const lanes = getSubAgentLanes({
+      subAgentSegments: [
+        {
+          id: 'a',
+          type: 'sub_agent',
+          title: 'thread.created',
+          description: 'A',
+          startMs: 0,
+          endMs: 10,
+          turnIndex: 0,
+          threadId: 'a',
+        },
+        {
+          id: 'b',
+          type: 'sub_agent',
+          title: 'thread.created',
+          description: 'B',
+          startMs: 2,
+          endMs: 8,
+          turnIndex: 0,
+          threadId: 'b',
+        },
+        {
+          id: 'c',
+          type: 'sub_agent',
+          title: 'thread.created',
+          description: 'C',
+          startMs: 10,
+          endMs: 12,
+          turnIndex: 0,
+          threadId: 'c',
+        },
+      ],
+      threadSegments: [],
+      minWidthMs: 1,
+    });
+    assert.equal(lanes.find(lane => lane.threadId === 'a')?.lane, 0);
+    assert.equal(lanes.find(lane => lane.threadId === 'b')?.lane, 1);
+    assert.equal(lanes.find(lane => lane.threadId === 'c')?.lane, 0);
+  });
+
+  it('groups coincident point events into one marker', () => {
+    assert.deepEqual(
+      groupCoincidentTimelineMarkers([
+        marker('user', 'user', 10),
+        marker('system', 'system', 10),
+        marker('error', 'error', 20),
+        ...bars([[10, 30, 0]]),
+      ]).map(group => ({
+        startMs: group.startMs,
+        ids: group.segments.map(segment => segment.id),
+      })),
+      [
+        { startMs: 10, ids: ['user', 'system'] },
+        { startMs: 20, ids: ['error'] },
+      ],
+    );
+  });
+
+  it('groups near-coincident markers within tolerance into one tooltip target', () => {
+    assert.deepEqual(
+      groupCoincidentTimelineMarkers(
+        [marker('auth', 'waiting_on_human', 10), marker('done', 'system', 14), marker('later', 'user', 40)],
+        { toleranceMs: 5 },
+      ).map(group => ({
+        startMs: group.startMs,
+        ids: group.segments.map(segment => segment.id),
+      })),
+      [
+        { startMs: 10, ids: ['auth', 'done'] },
+        { startMs: 40, ids: ['later'] },
+      ],
+    );
+  });
+
+  it('maps clean active-time ticks around fixed turn separators', () => {
+    const gaps = [{ startMs: 42_000, endMs: 43_000 }];
+    const ticks = buildTimelineAxisTicks({
+      activeTotalMs: 96_000,
+      turnStartsMs: [0, 42_000],
+      turnGapMs: 1_000,
+    });
+    assert.deepEqual(
+      ticks.map(tick => getActiveTimelineMs(tick.value, gaps)),
+      [0, 15_000, 30_000, 45_000, 60_000, 75_000, 90_000, 96_000],
+    );
+    assert.deepEqual(
+      ticks.map(tick => formatTimelineAxisDuration(getActiveTimelineMs(tick.value, gaps))),
+      ['0ms', '15s', '30s', '45s', '1m', '1.25m', '1.5m', '1.6m'],
+    );
+    assert.equal(formatTimelineAxisDuration(813_292), '13.55m');
+  });
+
+  it('changes axis units at one second, one minute, and one hour', () => {
+    assert.deepEqual([999, 1_000, 60_000, 3_600_000].map(formatTimelineAxisDuration), ['999ms', '1s', '1m', '1h']);
+  });
+
+  it('drops a regular tick that would overlap the exact endpoint', () => {
+    assert.deepEqual(
+      buildTimelineAxisTicks({
+        activeTotalMs: 121_000,
+        turnStartsMs: [0],
+        turnGapMs: 0,
+      }).map(tick => tick.value),
+      [0, 30_000, 60_000, 90_000, 121_000],
+    );
+  });
+
+  it('compresses inter-turn gaps onto a contiguous axis', () => {
+    const compressed = compressInterTurnGaps([
+      {
+        id: 'u1',
+        type: 'user',
+        title: 'user.message',
+        description: '',
+        startMs: 0,
+        endMs: 0,
+        turnIndex: 0,
+        threadId: 'main',
+        isMarker: true,
+      },
+      {
+        id: 'd1',
+        type: 'system',
+        title: 'turn.done',
+        description: '',
+        startMs: 50,
+        endMs: 50,
+        turnIndex: 0,
+        threadId: 'main',
+        isMarker: true,
+      },
+      {
+        id: 'u2',
+        type: 'user',
+        title: 'user.message',
+        description: '',
+        startMs: 500,
+        endMs: 500,
+        turnIndex: 1,
+        threadId: 'main',
+        isMarker: true,
+      },
+    ]);
+    assert.equal(compressed.find(segment => segment.id === 'u2')?.startMs, 50);
+  });
+});
+
+describe('buildSessionMetrics', () => {
+  it('derives tiles from terminal turn metrics and timeline segments', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'turn.done',
+          id: 't1-done',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:02.000Z',
+            output: null,
+            requiredActions: [],
+            ...{
+              metrics: {
+                totalTokens: 80,
+                totalCostInUsd: 0.5,
+                totalInputTokens: 50,
+                totalOutputTokens: 30,
+                totalCacheReadTokens: 0,
+                totalCacheWriteTokens: 0,
+                totalReasoningTokens: 0,
+              },
+            },
+          },
+          createdAt: '2026-01-01T00:00:02.000Z',
+          threadId: null,
+        },
+      },
+    ]);
+    const segments = buildSessionTimelineSegments(turns);
+    const metrics = buildSessionMetrics({ turns, segments });
+    assert.equal(metrics.totalTurns, 1);
+    assert.equal(metrics.wallTimeMs, 2_000);
+    assert.equal(metrics.totalCostUsd, 0.5);
+    assert.equal(metrics.totalTokens, 80);
+    assert.equal(metrics.tokenBreakdown.find(item => item.label === 'input')?.value, 50);
+    assert.equal(metrics.errors, 0);
+  });
+
+  it('emits a cancelled marker with reason and does not count it as an error', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      done({
+        turnId: 't1',
+        createdAt: '2026-01-01T00:00:05.000Z',
+        status: 'cancelled',
+        reason: 'client-cancelled',
+      }),
+    ]);
+    const segments = buildSessionTimelineSegments(turns);
+    const cancelled = segments.find(segment => segment.title === 'turn.cancelled');
+    assert.equal(cancelled?.type, 'system');
+    assert.equal(cancelled?.description, 'client-cancelled');
+    assert.equal(cancelled?.isMarker, true);
+    const metrics = buildSessionMetrics({ turns, segments });
+    assert.equal(metrics.errors, 0);
+  });
+
+  it('emits a thread.error marker for failed sub-agents and counts it in errors', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'model-1',
+          threadId: 'main',
+          content: 'spawn',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          toolCalls: [
+            {
+              id: 'call-sub',
+              type: 'function',
+              function: { name: 'create_sub_agent', arguments: '{}' },
+            },
+          ],
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'thread.created',
+          id: 'thread-1',
+          threadId: 'child',
+          title: 'Researcher',
+          createdAt: '2026-01-01T00:00:01.100Z',
+          agentInfo: { type: 'dynamic', name: 'researcher', input: 'research' },
+          parent: { threadId: 'main', toolCallId: 'call-sub' },
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'thread.done',
+          id: 'thread-done',
+          threadId: 'child',
+          title: 'Researcher',
+          createdAt: '2026-01-01T00:00:04.000Z',
+          state: { status: 'error', error: 'sub-agent blew up' },
+        },
+      },
+      done({ turnId: 't1', createdAt: '2026-01-01T00:00:05.000Z' }),
+    ]);
+
+    const segments = buildSessionTimelineSegments(turns);
+    const threadError = segments.find(segment => segment.title === 'thread.error');
+    assert.equal(threadError?.type, 'error');
+    assert.equal(threadError?.description, 'sub-agent blew up');
+    assert.equal(threadError?.threadId, 'child');
+    const metrics = buildSessionMetrics({ turns, segments });
+    assert.equal(metrics.errors, 1);
+  });
+
+  it('closes unfinished sub-agent bars at turn.done when thread.done is missing', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'model-1',
+          threadId: 'main',
+          content: 'spawn',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          toolCalls: [
+            {
+              id: 'call-sub',
+              type: 'function',
+              function: { name: 'create_sub_agent', arguments: '{}' },
+            },
+          ],
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'thread.created',
+          id: 'thread-1',
+          threadId: 'child',
+          title: 'Researcher',
+          createdAt: '2026-01-01T00:00:01.100Z',
+          agentInfo: { type: 'dynamic', name: 'researcher', input: 'research' },
+          parent: { threadId: 'main', toolCallId: 'call-sub' },
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'child-model',
+          threadId: 'child',
+          content: 'working',
+          createdAt: '2026-01-01T00:00:02.000Z',
+          toolCalls: [
+            {
+              id: 'call-exec',
+              type: 'function',
+              function: { name: 'exec', arguments: '{}' },
+            },
+          ],
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'tool.response',
+          id: 'tool-1',
+          threadId: 'child',
+          toolCallId: 'call-exec',
+          content: 'ok',
+          createdAt: '2026-01-01T00:00:04.000Z',
+        },
+      },
+      done({
+        turnId: 't1',
+        createdAt: '2026-01-01T00:00:05.000Z',
+        status: 'cancelled',
+        reason: 'client-cancelled',
+      }),
+    ]);
+
+    const segments = buildSessionTimelineSegments(turns);
+    const subAgent = segments.find(segment => segment.type === 'sub_agent');
+    assert.ok(subAgent);
+    assert.equal(subAgent.isMarker, false);
+    assert.equal(subAgent.startMs, 1_100);
+    assert.equal(subAgent.endMs, 5_000);
+    assert.ok(segments.some(segment => segment.threadId === 'child' && segment.type === 'tool_call'));
+  });
+
+  it('suppresses abort-shaped thread.error on cancelled turns and does not count it', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'model.message',
+          id: 'model-1',
+          threadId: 'main',
+          content: 'spawn',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          toolCalls: [
+            {
+              id: 'call-sub',
+              type: 'function',
+              function: { name: 'create_sub_agent', arguments: '{}' },
+            },
+          ],
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'thread.created',
+          id: 'thread-1',
+          threadId: 'child',
+          title: 'Researcher',
+          createdAt: '2026-01-01T00:00:01.100Z',
+          agentInfo: { type: 'dynamic', name: 'researcher', input: 'research' },
+          parent: { threadId: 'main', toolCallId: 'call-sub' },
+        },
+      },
+      {
+        turnId: 't1',
+        event: {
+          type: 'thread.done',
+          id: 'thread-done',
+          threadId: 'child',
+          title: 'Researcher',
+          createdAt: '2026-01-01T00:00:04.000Z',
+          state: { status: 'error', error: 'LLM stream aborted' },
+        },
+      },
+      done({
+        turnId: 't1',
+        createdAt: '2026-01-01T00:00:05.000Z',
+        status: 'cancelled',
+        reason: 'client-cancelled',
+      }),
+    ]);
+
+    const segments = buildSessionTimelineSegments(turns);
+    assert.equal(
+      segments.find(segment => segment.title === 'thread.error'),
+      undefined,
+    );
+    const cancelled = segments.find(segment => segment.title === 'turn.cancelled');
+    assert.equal(cancelled?.description, 'client-cancelled');
+    const metrics = buildSessionMetrics({ turns, segments });
+    assert.equal(metrics.errors, 0);
+  });
+
+  it('keeps aggregate cost undefined when no turn reports cost', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'turn.done',
+          id: 't1-done',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:02.000Z',
+            output: null,
+            requiredActions: [],
+            metrics: {
+              totalTokens: 80,
+              totalInputTokens: 50,
+              totalOutputTokens: 30,
+              totalCacheReadTokens: 0,
+              totalCacheWriteTokens: 0,
+              totalReasoningTokens: 0,
+            },
+          },
+          createdAt: '2026-01-01T00:00:02.000Z',
+          threadId: null,
+        },
+      },
+    ]);
+
+    const metrics = buildSessionMetrics({ turns, segments: buildSessionTimelineSegments(turns) });
+    assert.equal(metrics.totalCostUsd, undefined);
+  });
+
+  it('uses sessionMetrics for duration and cost; turn count always from events', () => {
+    const turns = buildSessionTurnViews([
+      created({ turnId: 't1', createdAt: '2026-01-01T00:00:00.000Z' }),
+      {
+        turnId: 't1',
+        event: {
+          type: 'turn.done',
+          id: 't1-done',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:02.000Z',
+            output: null,
+            requiredActions: [],
+            metrics: {
+              totalTokens: 80,
+              totalCostInUsd: 0.5,
+              totalInputTokens: 50,
+              totalOutputTokens: 30,
+              totalCacheReadTokens: 0,
+              totalCacheWriteTokens: 0,
+              totalReasoningTokens: 0,
+            },
+          },
+          createdAt: '2026-01-01T00:00:02.000Z',
+          threadId: null,
+        },
+      },
+    ]);
+    const metrics = buildSessionMetrics({
+      turns,
+      segments: buildSessionTimelineSegments(turns),
+      sessionMetrics: { totalDurationMs: 81_715, totalCostInUsd: 0.3106 },
+    });
+    assert.equal(metrics.totalTurns, 1);
+    assert.equal(metrics.wallTimeMs, 81_715);
+    assert.equal(metrics.totalCostUsd, 0.3106);
+    assert.equal(metrics.totalTokens, 80);
+  });
+
+  it('counts turns and tool calls from non-renderable resume turns', () => {
+    const turns = buildSessionTurnViews([
+      created({
+        turnId: 'auth',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }),
+      {
+        turnId: 'auth',
+        event: {
+          type: 'model.message',
+          id: 'auth-model',
+          threadId: 'main',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          content: '',
+          toolCalls: [{ id: 'call-auth', type: 'function', function: { name: 'list_tools', arguments: '{}' } }],
+        },
+      },
+      {
+        turnId: 'auth',
+        event: {
+          type: 'tool.response',
+          id: 'auth-resp',
+          threadId: 'main',
+          createdAt: '2026-01-01T00:00:01.500Z',
+          toolCallId: 'call-auth',
+          content: 'ok',
+        },
+      },
+      {
+        turnId: 'auth',
+        event: {
+          type: 'turn.done',
+          id: 'auth-done',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:02.000Z',
+            output: null,
+            requiredActions: [],
+            metrics: {
+              totalTokens: 100,
+              totalCostInUsd: 0.01,
+              totalInputTokens: 80,
+              totalOutputTokens: 20,
+              totalCacheReadTokens: 0,
+              totalCacheWriteTokens: 0,
+              totalReasoningTokens: 0,
+            },
+          },
+          createdAt: '2026-01-01T00:00:02.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'resume',
+        event: {
+          type: 'turn.created',
+          id: 'resume-created',
+          turnId: 'resume',
+          previousTurnId: 'auth',
+          state: { status: 'running' },
+          createdAt: '2026-01-01T00:00:03.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'resume',
+        event: {
+          type: 'model.message',
+          id: 'resume-model',
+          threadId: 'main',
+          createdAt: '2026-01-01T00:00:04.000Z',
+          content: '',
+          toolCalls: [
+            { id: 'call-a', type: 'function', function: { name: 'exec', arguments: '{}' } },
+            { id: 'call-b', type: 'function', function: { name: 'call_tool', arguments: '{}' } },
+          ],
+        },
+      },
+      {
+        turnId: 'resume',
+        event: {
+          type: 'tool.response',
+          id: 'resume-resp-a',
+          threadId: 'main',
+          createdAt: '2026-01-01T00:00:05.000Z',
+          toolCallId: 'call-a',
+          content: 'a',
+        },
+      },
+      {
+        turnId: 'resume',
+        event: {
+          type: 'tool.response',
+          id: 'resume-resp-b',
+          threadId: 'main',
+          createdAt: '2026-01-01T00:00:05.500Z',
+          toolCallId: 'call-b',
+          content: 'b',
+        },
+      },
+      {
+        turnId: 'resume',
+        event: {
+          type: 'turn.done',
+          id: 'resume-done',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:06.000Z',
+            output: null,
+            requiredActions: [],
+            metrics: {
+              totalTokens: 900,
+              totalCostInUsd: 0.09,
+              totalInputTokens: 700,
+              totalOutputTokens: 200,
+              totalCacheReadTokens: 0,
+              totalCacheWriteTokens: 0,
+              totalReasoningTokens: 0,
+            },
+          },
+          createdAt: '2026-01-01T00:00:06.000Z',
+          threadId: null,
+        },
+      },
+    ]);
+
+    assert.equal(turns.length, 2);
+    assert.equal(turns[0]?.renderable, true);
+    assert.equal(turns[1]?.renderable, false);
+
+    const segments = buildSessionTimelineSegments(turns);
+    assert.equal(
+      segments.filter(segment => segment.type === 'user').length,
+      1,
+      'non-renderable resume turns must not emit phantom user markers',
+    );
+    assert.equal(segments.filter(segment => segment.type === 'user')[0]?.turnIndex, 0);
+    assert.ok(
+      segments.every(segment => segment.turnIndex === 0),
+      'resume-turn activity stays on the same timeline band as the user turn',
+    );
+    assert.deepEqual(
+      segments.filter(segment => segment.title === 'turn.done').map(segment => segment.id),
+      ['resume-turn.done'],
+      'auth turn.done is omitted so it does not cover the resume model/tool bars',
+    );
+    // Auth's last bar ends at +1.5s; resume wall-clock starts later — compression removes the idle.
+    const resumeModel = segments.find(segment => segment.id === 'resume-model');
+    assert.equal(resumeModel?.startMs, 1_500);
+    const metrics = buildSessionMetrics({ turns, segments });
+    assert.equal(metrics.totalTurns, 2);
+    assert.equal(metrics.sessionTotalTurns, undefined);
+    assert.equal(metrics.toolCalls, 3);
+    assert.equal(metrics.totalTokens, 1000);
+    assert.deepEqual(
+      metrics.costPerTurn.map(row => row.label),
+      ['T1'],
+    );
+    assert.ok(Math.abs((metrics.costPerTurn[0]?.value ?? 0) - 0.1) < 1e-9);
+
+    const withSessionTotal = buildSessionMetrics({
+      turns,
+      segments,
+      sessionMetrics: { totalTurns: 4, totalDurationMs: 6_000 },
+    });
+    assert.equal(withSessionTotal.totalTurns, 2);
+    assert.equal(withSessionTotal.sessionTotalTurns, 4);
+
+    const matchedSessionTotal = buildSessionMetrics({
+      turns,
+      segments,
+      sessionMetrics: { totalTurns: 2, totalDurationMs: 6_000 },
+    });
+    assert.equal(matchedSessionTotal.sessionTotalTurns, undefined);
+  });
+});

@@ -1,0 +1,18 @@
+{
+  "servers": [
+    {
+      "name": "browser",
+      "delegation": "agent",
+      "enabled": true,
+      "command": "/absolute/path/to/inflex/capabilities/node_modules/.bin/playwright-mcp",
+      "args": ["--headless", "--isolated"]
+    },
+    {
+      "name": "computer",
+      "enabled": true,
+      "command": "/absolute/path/to/inflex/capabilities/node_modules/.bin/open-computer-use",
+      "args": ["mcp"]
+    },
+    { "name": "cad", "enabled": false, "command": "/absolute/path/to/your/cad-mcp-server", "args": [] }
+  ]
+}

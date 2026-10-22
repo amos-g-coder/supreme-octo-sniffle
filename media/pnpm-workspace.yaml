@@ -1,0 +1,14 @@
+packages:
+  - .
+confirmModulesPurge: false
+minimumReleaseAge: 0
+minimumReleaseAgeExclude:
+  - framefields@2.4.0
+
+allowBuilds:
+  esbuild: true
+  node-av: true
+  onnxruntime-node: true
+  protobufjs: true
+  skia-canvas: true
+  webgpu: true

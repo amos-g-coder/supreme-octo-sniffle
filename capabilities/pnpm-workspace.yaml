@@ -1,0 +1,6 @@
+packages:
+  - .
+minimumReleaseAge: 0
+confirmModulesPurge: false
+allowBuilds:
+  open-computer-use: true

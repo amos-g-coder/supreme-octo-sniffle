@@ -1,0 +1,93 @@
+---
+title: "Server"
+description: "Server factory, context hooks, shell mode, and contract types."
+---
+
+## Factory
+
+```ts
+createTrueForgeServer(options: CreateTrueForgeServerOptions): TrueForgeServer;
+```
+
+Required options: `{ chatServer, getCapabilities, getModels, getSkills, getMcp, searchAgents, saveAgent }`.
+Combines a chat server with your agent-management callbacks into a complete `AgentUIServer`.
+Optional callbacks are `getMcpConnector`, `getMcpTools`, `deleteAgent`, and `getMe`.
+Optional ports are `catalog`, `sessions`, `metrics`, `schedules`, `sandboxEnvironments`, and
+`permissions`; the factory attaches each supplied port to the resulting server.
+If you omit `deleteAgent`, calling it throws.
+
+## Context
+
+| Export | Behavior |
+| --- | --- |
+| `ServerProvider` | Supplies the resolved server. |
+| `useServer()` | The server; throws outside a provider. |
+| `useOptionalServer()` | The server, or `null` outside a provider. |
+| `useServerCapabilities()` | Resolved `getCapabilities()` data, or `null` while loading or on failure. |
+| `useCatalogServer()` | `server.catalog`; **throws** when absent. |
+| `useOptionalCatalogServer()` | `server.catalog`, or `null` when there is none. |
+| `useAgentSessionsServer()` / `useOptionalAgentSessionsServer()` | `server.sessions`; the required hook throws when absent, the optional hook returns `null`. |
+| `useAgentMetricsServer()` / `useOptionalAgentMetricsServer()` | `server.metrics`; the required hook throws when absent, the optional hook returns `null`. |
+| `useScheduleServer()` / `useOptionalScheduleServer()` | `server.schedules`; the required hook throws when absent, the optional hook returns `null`. |
+| `useOptionalPermissionsServer()` | `server.permissions`, or `null` when absent. |
+
+## Shell mode
+
+| Export | Behavior |
+| --- | --- |
+| `ShellModeProvider` | Derives shell capabilities from `agentConfig`. |
+| `useShellMode()` | Throws outside a provider. |
+| `useOptionalShellMode()` | Returns `null` outside a provider. |
+| `DEFAULT_AGENT_CONFIG` | `{ mode: "AgentLibraryWithComposer" }`. |
+
+`useShellMode()` reports which surfaces the current `agentConfig` permits —
+`isLibraryEnabled`, `isComposerEnabled`, `isNewChatEnabled` — and returns the actions
+`selectAgent`, `openDraft`, and `clearChat`, plus `settingsOpen` / `setSettingsOpen`. Use it in
+a custom layout to render only the controls that apply. See
+[Agent modes](/ui-sdk/concepts/agent-modes).
+
+## Contract types
+
+The full server contract is re-exported from the package root. The types you are most likely
+to reference:
+
+<AccordionGroup>
+  <Accordion title="Server interfaces">
+    `AgentUIServer`, `AgentChatServer`, `AgentBuilderServer`,
+    `AgentBuilderCapabilitiesResponse`, `CatalogServer`, `TrueForgeServerConfig`,
+    `CreateTrueForgeServerOptions`, `TrueForgeServer`.
+  </Accordion>
+  <Accordion title="Sessions and turns">
+    `Session`, `CreateSessionRequest`, `UpdateSessionRequest`, `Turn`, `TurnState`,
+    `PreviousTurnIdInput`.
+  </Accordion>
+  <Accordion title="Turn input">
+    `TurnInputItem`, `UserMessage`, `UserMessageContent`, `UserToolApprovalEvent`,
+    `UserToolResponseEvent`, `ApprovalDecision`.
+  </Accordion>
+  <Accordion title="Events and streaming">
+    `TurnStreamData`, `TurnStreamingEvent`, `SessionEventItem`. The concrete event shapes are in
+    [Streaming events](/ui-sdk/reference/events).
+  </Accordion>
+  <Accordion title="Agents and models">
+    `AgentSpec`, `AgentConfig`, `ShellMode`, `Model`, `ModelParams`, `SkillMount`,
+    `McpServerMount`, `SaveAgentRequest`.
+  </Accordion>
+  <Accordion title="Picker rows">
+    `ModelSelection`, `AgentSkill`, `ConnectorState`, `AgentLibraryEntry`,
+    `SearchAgentsParams`.
+  </Accordion>
+  <Accordion title="Pagination">
+    `ListResult`, `PageParams`, `ListSessionsParams`, `ListSessionsOrder`,
+    `ListSessionEventsParams`, `SearchAgentsParams`. List methods return `ListResult<T>`,
+    a plain object with `data` and optional `nextPageToken` / `previousPageToken`.
+  </Accordion>
+  <Accordion title="Catalog">
+    `ModelCatalogServer`, `ConnectorCatalogServer`, `SkillCatalogServer`,
+    `SandboxCatalogServer`, plus the `ModelProvider*`, `Connector*`, `Skill*`, and `Sandbox*`
+    families. See [Settings catalog](/ui-sdk/reference/catalog).
+  </Accordion>
+</AccordionGroup>
+
+Full method signatures are on [Server contract](/ui-sdk/setup-custom-servers/server-contract); a worked
+implementation is on [Bring your own server](/ui-sdk/setup-custom-servers/custom-server).

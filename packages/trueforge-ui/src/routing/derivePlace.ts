@@ -1,0 +1,45 @@
+import type { RoutePlace, ShellSnapshot } from './types.js';
+
+/**
+ * The chat place implied by shell state, ignoring settings, schedules,
+ * sessions-browser, and library overlays.
+ * SingleAgent canonicalizes to `root` so `/` and `/agents/{name}` alias.
+ */
+export function deriveChatPlace(snapshot: ShellSnapshot): RoutePlace {
+  // Access-error panes keep `pendingSessionId` for the deep link. Prefer it over
+  // a prior thread's `activeRemoteId` so shell→URL does not navigate away.
+  // Otherwise the live thread wins: reusing a mutable shell switches thread
+  // without a remount, leaving `pendingSessionId` on the session last opened.
+  const sessionId =
+    snapshot.sessionAccessError != null
+      ? snapshot.pendingSessionId
+      : (snapshot.activeRemoteId ?? snapshot.pendingSessionId);
+  if (sessionId != null) return { type: 'session', sessionId };
+
+  const { mode, agentConfigMode } = snapshot;
+  if (mode.status === 'active' && mode.isMutable && mode.isCreateAgent) {
+    return { type: 'buildAgent' };
+  }
+
+  if (mode.status === 'active' && !mode.isMutable && agentConfigMode !== 'SingleAgent') {
+    const agentName = mode.agentName ?? mode.agentId;
+    if (agentName != null) return { type: 'agent', agentName };
+  }
+  return { type: 'root' };
+}
+
+/** Full place with overlay priority: settings, schedules, environments, sessions, library, chat. */
+export function derivePlace(snapshot: ShellSnapshot): RoutePlace {
+  if (snapshot.settingsOpen) return { type: 'settings' };
+  if (snapshot.schedulesOpen) return { type: 'schedules' };
+  if (snapshot.environmentsOpen) return { type: 'environments' };
+  if (snapshot.sessionsOpen && snapshot.sharedSessionId != null) {
+    return { type: 'sharedSession', sessionId: snapshot.sharedSessionId };
+  }
+  if (snapshot.sessionsOpen) return { type: 'sessionsBrowser' };
+  if (snapshot.libraryOpen && snapshot.libraryAgentId != null) {
+    return { type: 'libraryAgent', agentId: snapshot.libraryAgentId };
+  }
+  if (snapshot.libraryOpen) return { type: 'library' };
+  return deriveChatPlace(snapshot);
+}

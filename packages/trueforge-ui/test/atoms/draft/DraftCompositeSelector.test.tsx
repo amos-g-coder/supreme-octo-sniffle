@@ -1,0 +1,634 @@
+// @vitest-environment jsdom
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { DraftCatalogProvider } from '@/atoms/draft/DraftCatalogProvider.js';
+import { DraftCompositeSelector } from '@/atoms/draft/DraftCompositeSelector.js';
+import { CompactLayoutProvider } from '@/atoms/lib/CompactLayoutContext.js';
+import { ServerProvider } from '@/server/ServerContext.js';
+import type {
+  AgentSkill,
+  AgentSpec,
+  CatalogServer,
+  SandboxCatalogServer,
+  SandboxEnvironmentServer,
+  SkillCatalogServer,
+} from '@/server/types.js';
+import {
+  createMockAgentUIServer,
+  createMockCatalog,
+  createMockSandboxEnvironmentServer,
+} from '../../server/mockServer.js';
+
+let agentSpec: AgentSpec;
+let draftSessionId: string | undefined;
+const updateAgentSpec = vi.fn();
+const setSettingsOpen = vi.fn();
+const rememberDraftSpec = vi.fn();
+
+async function unavailable(): Promise<never> {
+  throw new Error('Unexpected settings catalog call');
+}
+
+const skillCatalog: SkillCatalogServer = {
+  getSkillCatalog: async () => [],
+  listSkills: async () => [],
+  createSkill: unavailable,
+};
+
+const sandboxCatalog: SandboxCatalogServer = {
+  getSandboxProviderCatalog: async () => [],
+  listSandboxProviders: async () => [],
+  createSandboxProvider: unavailable,
+  updateSandboxProvider: unavailable,
+};
+
+const settingsCatalog = createMockCatalog({ skillCatalog, sandboxCatalog });
+
+const setEnvironmentsOpen = vi.fn();
+
+vi.mock('@truefoundry/trueforge-assistant-ui-runtime', () => ({
+  useTrueForgeAgentSpec: () => ({ agentSpec, draftSessionId }),
+  useTrueForgeUpdateAgentSpec: () => updateAgentSpec,
+}));
+
+vi.mock('@/server/ShellModeContext.js', () => ({
+  useOptionalShellMode: () => ({ setSettingsOpen, setEnvironmentsOpen, rememberDraftSpec }),
+}));
+
+beforeAll(() => {
+  HTMLDialogElement.prototype.showModal = function showModal() {
+    this.setAttribute('open', '');
+  };
+  HTMLDialogElement.prototype.close = function close() {
+    this.removeAttribute('open');
+    this.dispatchEvent(new Event('close'));
+  };
+});
+
+function renderSelector({
+  onAttach,
+  getCapabilities,
+  getSkills,
+  getMcp,
+  catalog = settingsCatalog,
+  compact = false,
+  environmentServer,
+}: {
+  onAttach?: () => void;
+  getCapabilities?: () => Promise<{
+    data: {
+      sandbox: { enabled: boolean };
+      skill: { enabled: boolean; reason?: string };
+      settings?: { enabled: boolean };
+      webSearch?: { enabled: boolean };
+    };
+  }>;
+  getSkills?: () => Promise<AgentSkill[]>;
+  getMcp?: () => Promise<{ id: string; name: string; authenticated: boolean }[]>;
+  catalog?: CatalogServer | null;
+  compact?: boolean;
+  environmentServer?: SandboxEnvironmentServer;
+} = {}) {
+  const server = createMockAgentUIServer({
+    ...(catalog === null ? {} : { catalog }),
+    ...(environmentServer ? { sandboxEnvironments: environmentServer } : {}),
+    getCapabilities:
+      getCapabilities ??
+      (async () => ({
+        data: {
+          sandbox: { enabled: true },
+          skill: { enabled: true },
+        },
+      })),
+    getModels: async () => [],
+    getSkills: getSkills ?? (async () => [{ id: 'research', name: 'Research' }]),
+    getMcp:
+      getMcp ??
+      (async () => [
+        { id: 'github', name: 'GitHub', authenticated: true },
+        { id: 'slack', name: 'Slack', authenticated: true },
+      ]),
+  });
+  const selector = (
+    <ServerProvider server={server}>
+      <DraftCatalogProvider>
+        <DraftCompositeSelector onAttach={onAttach} />
+      </DraftCatalogProvider>
+    </ServerProvider>
+  );
+  return render(compact ? <CompactLayoutProvider>{selector}</CompactLayoutProvider> : selector);
+}
+
+describe('DraftCompositeSelector', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    draftSessionId = undefined;
+    agentSpec = {
+      model: { name: 'openai/gpt-4.1' },
+      mcpServers: [{ id: 'slack', name: 'Slack' }],
+      skills: [{ id: 'research', name: 'Research' }],
+    };
+    updateAgentSpec.mockReset();
+    setSettingsOpen.mockReset();
+    setEnvironmentsOpen.mockReset();
+    rememberDraftSpec.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('shows one combined Tools count only for a valid model', () => {
+    const view = renderSelector();
+    const toolsTrigger = screen.getByRole('button', { name: 'Tools (2)' });
+    expect(toolsTrigger).toHaveTextContent('Tools');
+    expect(toolsTrigger).toHaveTextContent('2');
+    fireEvent.click(toolsTrigger);
+    expect(screen.getByRole('dialog', { name: 'Add to composer' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Connectors/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Skills/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Capabilities/ })).not.toBeInTheDocument();
+
+    agentSpec = { ...agentSpec, model: { name: '  ' } };
+    view.rerender(
+      <ServerProvider server={createMockAgentUIServer()}>
+        <DraftCatalogProvider>
+          <DraftCompositeSelector />
+        </DraftCatalogProvider>
+      </ServerProvider>,
+    );
+    expect(screen.queryByRole('button', { name: /Tools/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'Add to composer' })).not.toBeInTheDocument();
+  });
+
+  it('keeps registry skills plain in the draft composer', async () => {
+    const loadVersions = vi.fn(async () => []);
+    const skill: AgentSkill = Object.assign(
+      { id: 'agent-skill:acme/team-a/echo:3', name: 'echo' },
+      { version: 3, loadVersions },
+    );
+    renderSelector({ getSkills: async () => [skill] });
+
+    fireEvent.click(screen.getByRole('button', { name: /Tools/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+
+    expect(await screen.findByRole('menuitemcheckbox', { name: /echo/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Select version for echo' })).not.toBeInTheDocument();
+    expect(loadVersions).not.toHaveBeenCalled();
+  });
+
+  it('uses contrasting search surfaces in light and dark themes', () => {
+    renderSelector();
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+
+    expect(screen.getByPlaceholderText('Search connectors...')).toHaveClass(
+      'border-input-border',
+      'bg-secondary-bg',
+      'dark:bg-primary-bg',
+    );
+  });
+
+  it('filters the complete connector catalog client-side', async () => {
+    renderSelector();
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+
+    expect(await screen.findByRole('menuitemcheckbox', { name: /GitHub/ })).toBeInTheDocument();
+    expect(screen.getByRole('menuitemcheckbox', { name: /Slack/ })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText('Search connectors...'), { target: { value: 'git' } });
+
+    expect(screen.getByRole('menuitemcheckbox', { name: /GitHub/ })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitemcheckbox', { name: /Slack/ })).not.toBeInTheDocument();
+  });
+
+  it('shows selected connectors and skills in the Tools tooltip', () => {
+    renderSelector();
+    fireEvent.mouseEnter(screen.getByRole('button', { name: 'Tools (2)' }));
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Connectors: Slack');
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Skills: Research');
+  });
+
+  it('truncates Tools tooltip names after 4 with a remainder count', () => {
+    agentSpec = {
+      ...agentSpec,
+      mcpServers: [
+        { id: 'a', name: 'Alpha' },
+        { id: 'b', name: 'Beta' },
+        { id: 'c', name: 'Gamma' },
+        { id: 'd', name: 'Delta' },
+        { id: 'e', name: 'Epsilon' },
+        { id: 'f', name: 'Zeta' },
+      ],
+      skills: [],
+    };
+    renderSelector();
+    fireEvent.mouseEnter(screen.getByRole('button', { name: 'Tools (6)' }));
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Connectors: Alpha, Beta, Gamma, Delta +2');
+  });
+
+  it('renders attachment as a standalone tooltip control', () => {
+    const onAttach = vi.fn();
+    renderSelector({ onAttach });
+
+    const attach = screen.getByRole('button', { name: 'Attach a file' });
+    fireEvent.mouseEnter(attach);
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Attach a file');
+    fireEvent.click(attach);
+    expect(onAttach).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('dialog', { name: 'Add to composer' })).not.toBeInTheDocument();
+  });
+
+  it('groups compact tools and attachment actions under a plus menu', () => {
+    const onAttach = vi.fn();
+    renderSelector({ onAttach, compact: true });
+
+    expect(screen.queryByRole('button', { name: 'Tools (2)' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Attach a file' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+    expect(screen.getByRole('menuitem', { name: 'Tools (2)' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Attach a file' }));
+
+    expect(onAttach).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Tools (2)' }));
+    expect(screen.getByRole('dialog', { name: 'Add to composer' })).toBeInTheDocument();
+  });
+
+  it('debounces connector changes into one draft update', async () => {
+    renderSelector();
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    fireEvent.click(await screen.findByRole('menuitemcheckbox', { name: /GitHub/ }));
+
+    expect(updateAgentSpec).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+    });
+    expect(updateAgentSpec).toHaveBeenCalledWith({
+      mcpServers: [
+        { id: 'slack', name: 'Slack' },
+        { id: 'github', name: 'GitHub' },
+      ],
+      skills: [{ id: 'research', name: 'Research' }],
+    });
+  });
+
+  it('opens settings from the empty connectors state', async () => {
+    renderSelector({ getMcp: async () => [] });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+
+    fireEvent.click(await screen.findByRole('button', { name: /Please configure Connectors in the settings/ }));
+
+    expect(setSettingsOpen).toHaveBeenCalledWith(true, 'connectors');
+    expect(screen.queryByRole('dialog', { name: 'Add to composer' })).not.toBeInTheDocument();
+  });
+
+  it('opens settings from the empty skills state', async () => {
+    renderSelector({ getSkills: async () => [] });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+
+    fireEvent.click(await screen.findByRole('button', { name: /Please configure Skills in the settings/ }));
+
+    expect(setSettingsOpen).toHaveBeenCalledWith(true, 'skills');
+  });
+
+  it('explains the sandbox requirement when skills are unavailable', async () => {
+    renderSelector({
+      getCapabilities: async () => ({
+        data: {
+          sandbox: { enabled: false },
+          skill: { enabled: false, reason: 'Skills run in a sandbox, which is not configured.' },
+        },
+      }),
+      getSkills: async () => [],
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Skills run in a sandbox, which is not configured.');
+    const emptyState = screen.getByRole('button', { name: /Please configure a Sandbox in the settings/ });
+    fireEvent.click(emptyState);
+
+    expect(setSettingsOpen).toHaveBeenCalledWith(true, 'sandbox');
+  });
+
+  it('opens skills settings when skills are empty and a sandbox is already configured', async () => {
+    renderSelector({
+      getCapabilities: async () => ({
+        data: {
+          sandbox: { enabled: true },
+          skill: { enabled: false, reason: 'Skills are not available.' },
+        },
+      }),
+      getSkills: async () => [],
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+
+    fireEvent.click(await screen.findByRole('button', { name: /Please configure Skills in the settings/ }));
+
+    expect(setSettingsOpen).toHaveBeenCalledWith(true, 'skills');
+  });
+
+  it('does not offer connector settings without a settings catalog', async () => {
+    renderSelector({ getMcp: async () => [], catalog: null });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+
+    expect(await screen.findByText('No connectors')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Please configure Connectors/ })).not.toBeInTheDocument();
+  });
+
+  it('does not offer connector settings when settings are disabled', async () => {
+    renderSelector({
+      getCapabilities: async () => ({
+        data: {
+          sandbox: { enabled: true },
+          skill: { enabled: true },
+          settings: { enabled: false },
+        },
+      }),
+      getMcp: async () => [],
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+
+    expect(await screen.findByText('No connectors')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Please configure Connectors/ })).not.toBeInTheDocument();
+  });
+
+  it('does not offer skills settings when the skills settings section is unavailable', async () => {
+    renderSelector({ getSkills: async () => [], catalog: createMockCatalog() });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+
+    expect(await screen.findByText('No skills')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Please configure Skills/ })).not.toBeInTheDocument();
+  });
+
+  it('does not offer sandbox settings when the sandbox settings section is unavailable', async () => {
+    renderSelector({
+      getCapabilities: async () => ({
+        data: {
+          sandbox: { enabled: false },
+          skill: { enabled: false, reason: 'Skills run in a sandbox, which is not configured.' },
+        },
+      }),
+      getSkills: async () => [],
+      catalog: createMockCatalog({ skillCatalog }),
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    fireEvent.click(screen.getByRole('button', { name: /Skills/ }));
+
+    expect(await screen.findByText('No skills')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Please configure a Sandbox/ })).not.toBeInTheDocument();
+  });
+
+  it('renders environment tab with default and ready environments only, excluding pending/failed and status badges', async () => {
+    const environmentServer = createMockSandboxEnvironmentServer({
+      listEnvironments: async () => ({
+        data: [
+          {
+            id: 'env-default',
+            name: 'default',
+            description: 'Default environment',
+            status: 'ready',
+            statusReason: null,
+            manifest: { name: 'default', description: 'Default environment' },
+            createdBySubject: { subjectId: 'u1', subjectType: 'user', subjectDisplayName: 'user-1' },
+            createdAt: '2026-09-01T10:00:00Z',
+            updatedAt: '2026-09-01T10:00:00Z',
+          },
+          {
+            id: 'env-1',
+            name: 'python-dev',
+            description: 'Python 3.11 environment with poetry',
+            status: 'ready',
+            statusReason: null,
+            manifest: { name: 'python-dev', description: 'Python 3.11 environment with poetry' },
+            createdBySubject: { subjectId: 'u1', subjectType: 'user', subjectDisplayName: 'user-1' },
+            createdAt: '2026-09-01T10:00:00Z',
+            updatedAt: '2026-09-01T10:00:00Z',
+          },
+          {
+            id: 'env-2',
+            name: 'building-env',
+            description: '',
+            status: 'pending',
+            statusReason: null,
+            manifest: { name: 'building-env' },
+            createdBySubject: { subjectId: 'u1', subjectType: 'user', subjectDisplayName: 'user-1' },
+            createdAt: '2026-09-01T10:00:00Z',
+            updatedAt: '2026-09-01T10:00:00Z',
+          },
+          {
+            id: 'env-3',
+            name: 'broken-env',
+            description: '',
+            status: 'failed',
+            statusReason: 'Build failed',
+            manifest: { name: 'broken-env' },
+            createdBySubject: { subjectId: 'u1', subjectType: 'user', subjectDisplayName: 'user-1' },
+            createdAt: '2026-09-01T10:00:00Z',
+            updatedAt: '2026-09-01T10:00:00Z',
+          },
+        ],
+      }),
+    });
+
+    renderSelector({ environmentServer });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    fireEvent.click(screen.getByRole('button', { name: /Environment/ }));
+
+    expect(await screen.findByText('default')).toBeInTheDocument();
+    expect(screen.getByText('Default environment')).toBeInTheDocument();
+    expect(await screen.findByText('python-dev')).toBeInTheDocument();
+    expect(screen.getByText('Python 3.11 environment with poetry')).toBeInTheDocument();
+
+    // pending and failed environments must NOT be displayed
+    expect(screen.queryByText('building-env')).not.toBeInTheDocument();
+    expect(screen.queryByText('broken-env')).not.toBeInTheDocument();
+
+    // No "Ready" status badge should be rendered
+    expect(screen.queryByText('Ready')).not.toBeInTheDocument();
+
+    // Select custom environment
+    fireEvent.click(screen.getByText('python-dev'));
+    expect(updateAgentSpec).toHaveBeenCalledWith({
+      config: expect.objectContaining({
+        sandbox: expect.objectContaining({
+          enabled: true,
+          environmentName: 'python-dev',
+        }),
+      }),
+    });
+
+    // Select default environment clears environmentName
+    fireEvent.click(screen.getByText('default'));
+    expect(updateAgentSpec).toHaveBeenCalledWith({
+      config: expect.objectContaining({
+        sandbox: expect.objectContaining({
+          environmentName: undefined,
+        }),
+      }),
+    });
+  });
+
+  it('locks environment selection once a chat session exists', async () => {
+    draftSessionId = 'session-1';
+    agentSpec = {
+      ...agentSpec,
+      config: { sandbox: { enabled: true, environmentName: 'python-dev' } },
+    };
+    const environmentServer = createMockSandboxEnvironmentServer({
+      listEnvironments: async () => ({
+        data: [
+          {
+            id: 'env-default',
+            name: 'default',
+            description: 'Default environment',
+            status: 'ready',
+            statusReason: null,
+            manifest: { name: 'default', description: 'Default environment' },
+            createdBySubject: { subjectId: 'u1', subjectType: 'user', subjectDisplayName: 'user-1' },
+            createdAt: '2026-09-01T10:00:00Z',
+            updatedAt: '2026-09-01T10:00:00Z',
+          },
+          {
+            id: 'env-1',
+            name: 'python-dev',
+            description: 'Python 3.11 environment',
+            status: 'ready',
+            statusReason: null,
+            manifest: { name: 'python-dev', description: 'Python 3.11 environment' },
+            createdBySubject: { subjectId: 'u1', subjectType: 'user', subjectDisplayName: 'user-1' },
+            createdAt: '2026-09-01T10:00:00Z',
+            updatedAt: '2026-09-01T10:00:00Z',
+          },
+        ],
+      }),
+    });
+
+    renderSelector({ environmentServer });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    fireEvent.click(screen.getByRole('button', { name: /Environment/ }));
+
+    expect(await screen.findByText("Can't change the environment after a chat has started")).toBeInTheDocument();
+    fireEvent.click(screen.getByText('default'));
+    expect(updateAgentSpec).not.toHaveBeenCalled();
+  });
+
+  it('shows a deleted environment from the agent spec and does not change it', async () => {
+    agentSpec = {
+      ...agentSpec,
+      config: { sandbox: { enabled: true, environmentName: 'gone-env' } },
+    };
+    const environmentServer = createMockSandboxEnvironmentServer({
+      listEnvironments: async () => ({
+        data: [
+          {
+            id: 'env-default',
+            name: 'default',
+            description: 'Default environment',
+            status: 'ready',
+            statusReason: null,
+            manifest: { name: 'default', description: 'Default environment' },
+            createdBySubject: { subjectId: 'u1', subjectType: 'user', subjectDisplayName: 'user-1' },
+            createdAt: '2026-09-01T10:00:00Z',
+            updatedAt: '2026-09-01T10:00:00Z',
+          },
+        ],
+      }),
+    });
+
+    renderSelector({ environmentServer });
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    fireEvent.click(screen.getByRole('button', { name: /Environment/ }));
+
+    expect(await screen.findByText('gone-env')).toBeInTheDocument();
+    expect(screen.queryByText('This environment is no longer available')).not.toBeInTheDocument();
+    const goneRow = screen.getByRole('menuitemradio', { name: /gone-env/ });
+    expect(goneRow).toHaveAttribute('aria-checked', 'true');
+    expect(goneRow).toHaveAttribute('aria-disabled', 'true');
+
+    fireEvent.click(screen.getByText('gone-env'));
+    expect(updateAgentSpec).not.toHaveBeenCalled();
+  });
+
+  it('shows Web search under Built-in and toggles draft config when available', async () => {
+    agentSpec = {
+      ...agentSpec,
+      config: { webSearch: { enabled: true } },
+    };
+    renderSelector({
+      getCapabilities: async () => ({
+        data: {
+          sandbox: { enabled: true },
+          skill: { enabled: true },
+          webSearch: { enabled: true },
+        },
+      }),
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (3)' }));
+    expect(screen.getByText('Built-in')).toBeInTheDocument();
+    await waitFor(() => {
+      const row = screen.getByRole('menuitemcheckbox', { name: /Web search/ });
+      expect(row).toBeEnabled();
+      expect(row).toHaveAttribute('aria-checked', 'true');
+    });
+
+    fireEvent.click(screen.getByRole('menuitemcheckbox', { name: /Web search/ }));
+    expect(updateAgentSpec).toHaveBeenCalledWith({
+      config: { webSearch: { enabled: false } },
+    });
+    expect(rememberDraftSpec).toHaveBeenCalledWith(
+      {
+        ...agentSpec,
+        config: { webSearch: { enabled: false } },
+      },
+      'chat',
+    );
+  });
+
+  it('keeps Web search disabled with a tooltip when the capability is off', async () => {
+    agentSpec = {
+      ...agentSpec,
+      config: { webSearch: { enabled: false } },
+    };
+    renderSelector({
+      getCapabilities: async () => ({
+        data: {
+          sandbox: { enabled: true },
+          skill: { enabled: true },
+          webSearch: { enabled: false },
+        },
+      }),
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tools (2)' }));
+    await waitFor(() => {
+      const row = screen.getByRole('menuitemcheckbox', { name: /Web search/ });
+      expect(row).toHaveAttribute('aria-disabled', 'true');
+      expect(row).toHaveAttribute('aria-checked', 'false');
+    });
+
+    const checkbox = screen.getByRole('checkbox', { name: /Select Web search/ });
+    expect(checkbox).toBeDisabled();
+    fireEvent.mouseEnter(checkbox.parentElement!);
+    expect(await screen.findByRole('tooltip')).toHaveTextContent('Web search is not configured');
+
+    fireEvent.mouseLeave(checkbox.parentElement!);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+
+    fireEvent.mouseEnter(screen.getByRole('menuitemcheckbox', { name: /Web search/ }));
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+
+    fireEvent.click(checkbox);
+    expect(updateAgentSpec).not.toHaveBeenCalled();
+  });
+});

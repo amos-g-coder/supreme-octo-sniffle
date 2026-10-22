@@ -1,0 +1,278 @@
+import { CreatedBySubjectSchema, type TokenPagination } from '@truefoundry/trueforge-core/agent-session';
+import {
+  decodeOffsetPageToken,
+  paginateOffsetRows,
+} from '@truefoundry/trueforge-core/agent-session/store/OffsetPageToken';
+import { sql, type Kysely, type RawBuilder, type Selectable, type Transaction } from 'kysely';
+import { newId } from '../../../utils/id';
+import {
+  AgentExternalIdConflictError,
+  AgentNameConflictError,
+  parseStoredAgentSpec,
+  type AgentCatalogEntity,
+  type AgentCatalogUsageRow,
+  type AgentExternalIdRow,
+  type AgentRecord,
+  type CreateAgentInput,
+  type DeleteAgentInput,
+  type GetAgentInput,
+  type GetExternalIdsByIdsInput,
+  type GetOwnedIdsInput,
+  type IAgentStore,
+  type ListAgentCatalogUsageInput,
+  type ListAgentNamesUsingSandboxEnvironmentInput,
+  type ListAgentsInput,
+  type UpdateAgentInput,
+} from '../../agentStore';
+import { AGENT_EXTERNAL_ID_UQ } from '../../indexes';
+import { isPgConstraint, isUniqueViolation } from '../client';
+import { json, now } from '../sqlExpressions';
+import type { AgentTable, Database } from '../types';
+
+function toRecord(row: Selectable<AgentTable>): AgentRecord {
+  return {
+    id: row.id,
+    tenant_id: row.tenant_id,
+    name: row.name,
+    description: row.description,
+    manifest: parseStoredAgentSpec(row.manifest),
+    external_id: row.external_id,
+    created_by_subject: CreatedBySubjectSchema.parse(row.created_by_subject),
+    created_at: row.created_at.toISOString(),
+    updated_at: row.updated_at.toISOString(),
+  };
+}
+
+/** Map unique violations to external_id vs name conflicts. */
+function throwAgentUniqueViolation({
+  error,
+  tenant_id,
+  name,
+  external_id,
+}: {
+  error: unknown;
+  tenant_id: string;
+  name: string;
+  external_id: string | null;
+}): never {
+  if (isPgConstraint(error, AGENT_EXTERNAL_ID_UQ) && external_id) {
+    throw new AgentExternalIdConflictError({ tenant_id, external_id }, { cause: error });
+  }
+  throw new AgentNameConflictError({ tenant_id, name }, { cause: error });
+}
+
+/** `jsonb_array_elements` rejects anything but an array, so absent/null keys read as empty. */
+function jsonArray(path: RawBuilder<unknown>) {
+  return sql`CASE WHEN jsonb_typeof(${path}) = 'array' THEN ${path} ELSE '[]'::jsonb END`;
+}
+
+/**
+ * Every `(agent, referenced name)` pair a manifest exposes for one entity kind.
+ * A provider is referenced through the segment of `model.name` before the first `/`.
+ */
+function catalogUsagePairs({ entity, tenant_id }: { entity: AgentCatalogEntity; tenant_id: string }) {
+  switch (entity) {
+    case 'model_provider':
+      return sql`
+        SELECT name AS agent_name, split_part(manifest->'model'->>'name', '/', 1) AS reference_name
+        FROM agent WHERE tenant_id = ${tenant_id}`;
+    case 'model':
+      return sql`
+        SELECT name AS agent_name, manifest->'model'->>'name' AS reference_name
+        FROM agent WHERE tenant_id = ${tenant_id}`;
+    case 'mcp_server':
+      return sql`
+        SELECT agent.name AS agent_name, entry.value->>'name' AS reference_name
+        FROM agent
+        CROSS JOIN LATERAL jsonb_array_elements(${jsonArray(sql`manifest->'mcp_servers'`)}) AS entry(value)
+        WHERE tenant_id = ${tenant_id}`;
+    case 'skill':
+      return sql`
+        SELECT agent.name AS agent_name, entry.value->>'name' AS reference_name
+        FROM agent
+        CROSS JOIN LATERAL jsonb_array_elements(${jsonArray(sql`manifest->'skills'`)}) AS entry(value)
+        WHERE tenant_id = ${tenant_id}`;
+  }
+}
+
+export class PostgresAgentStore implements IAgentStore<Transaction<Database>> {
+  readonly #db: Kysely<Database>;
+
+  constructor(db: Kysely<Database>) {
+    this.#db = db;
+  }
+
+  async listAgents(
+    input: ListAgentsInput,
+    transaction?: Transaction<Database>,
+  ): Promise<{ data: AgentRecord[]; pagination: TokenPagination }> {
+    if (input.external_ids?.length === 0) {
+      return { data: [], pagination: { limit: input.limit ?? 0 } };
+    }
+    const db = transaction ?? this.#db;
+    let query = db.selectFrom('agent').selectAll().where('tenant_id', '=', input.tenant_id);
+    if (input.external_ids !== undefined) {
+      query = query.where('external_id', 'in', [...input.external_ids]);
+    }
+    if (input.agent_name !== undefined) {
+      query = query.where(sql<boolean>`position(lower(${input.agent_name}) in lower(name)) > 0`);
+    }
+    query = query.orderBy('name');
+    if (input.limit === undefined) {
+      const rows = await query.execute();
+      const data = rows.map(toRecord);
+      return { data, pagination: { limit: data.length } };
+    }
+    const offset = decodeOffsetPageToken(input.page_token);
+    const rows = await query
+      .limit(input.limit + 1)
+      .offset(offset)
+      .execute();
+    const { data, pagination } = paginateOffsetRows(rows, input.limit, offset);
+    return { data: data.map(toRecord), pagination };
+  }
+
+  async getOwnedIds(input: GetOwnedIdsInput, transaction?: Transaction<Database>): Promise<readonly string[]> {
+    if (input.ids.length === 0) {
+      return [];
+    }
+    const db = transaction ?? this.#db;
+    const rows = await db
+      .selectFrom('agent')
+      .select('id')
+      .where('tenant_id', '=', input.tenant_id)
+      .where('id', 'in', [...input.ids])
+      .where(sql`created_by_subject->>'subject_id'`, '=', input.subject_id)
+      .execute();
+    return rows.map(row => row.id);
+  }
+
+  async getExternalIdsByIds(
+    input: GetExternalIdsByIdsInput,
+    transaction?: Transaction<Database>,
+  ): Promise<readonly AgentExternalIdRow[]> {
+    if (input.ids.length === 0) {
+      return [];
+    }
+    const db = transaction ?? this.#db;
+    const rows = await db
+      .selectFrom('agent')
+      .select(['id', 'external_id'])
+      .where('tenant_id', '=', input.tenant_id)
+      .where('id', 'in', [...input.ids])
+      .where('external_id', 'is not', null)
+      .execute();
+    return rows.flatMap(row => (row.external_id ? [{ id: row.id, external_id: row.external_id }] : []));
+  }
+
+  async getAgent(input: GetAgentInput, transaction?: Transaction<Database>): Promise<AgentRecord | undefined> {
+    const db = transaction ?? this.#db;
+    let query = db.selectFrom('agent').selectAll().where('tenant_id', '=', input.tenant_id);
+    if ('id' in input) {
+      query = query.where('id', '=', input.id);
+    } else {
+      query = query.where('name', '=', input.name);
+    }
+    const row = await query.executeTakeFirst();
+    return row === undefined ? undefined : toRecord(row);
+  }
+
+  async createAgent(input: CreateAgentInput, transaction?: Transaction<Database>): Promise<AgentRecord> {
+    const db = transaction ?? this.#db;
+    try {
+      const row = await db
+        .insertInto('agent')
+        .values({
+          id: newId(),
+          tenant_id: input.tenant_id,
+          name: input.name,
+          description: input.description,
+          manifest: json(input.manifest),
+          external_id: input.external_id,
+          created_by_subject: json(input.created_by_subject),
+          created_at: now(),
+          updated_at: now(),
+        })
+        .returningAll()
+        .executeTakeFirstOrThrow();
+      return toRecord(row);
+    } catch (error) {
+      if (isUniqueViolation(error)) {
+        throwAgentUniqueViolation({
+          error,
+          tenant_id: input.tenant_id,
+          name: input.name,
+          external_id: input.external_id,
+        });
+      }
+      throw error;
+    }
+  }
+
+  async updateAgent(input: UpdateAgentInput, transaction?: Transaction<Database>): Promise<AgentRecord | undefined> {
+    if (input.manifest === undefined && input.description === undefined && input.external_id === undefined) {
+      throw new Error('updateAgent requires manifest, description, and/or external_id');
+    }
+    const db = transaction ?? this.#db;
+    try {
+      const row = await db
+        .updateTable('agent')
+        .set({
+          ...(input.manifest === undefined ? {} : { manifest: json(input.manifest) }),
+          ...(input.description === undefined ? {} : { description: input.description }),
+          ...(input.external_id === undefined ? {} : { external_id: input.external_id }),
+          updated_at: now(),
+        })
+        .where('tenant_id', '=', input.tenant_id)
+        .where('id', '=', input.id)
+        .returningAll()
+        .executeTakeFirst();
+      return row === undefined ? undefined : toRecord(row);
+    } catch (error) {
+      if (isUniqueViolation(error) && input.external_id) {
+        throw new AgentExternalIdConflictError(
+          { tenant_id: input.tenant_id, external_id: input.external_id },
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
+  async deleteAgent(input: DeleteAgentInput, transaction?: Transaction<Database>): Promise<void> {
+    const db = transaction ?? this.#db;
+    await db.deleteFrom('agent').where('tenant_id', '=', input.tenant_id).where('id', '=', input.id).execute();
+  }
+
+  async listAgentCatalogUsage(
+    input: ListAgentCatalogUsageInput,
+    transaction?: Transaction<Database>,
+  ): Promise<readonly AgentCatalogUsageRow[]> {
+    if (input.names.length === 0) {
+      return [];
+    }
+    const db = transaction ?? this.#db;
+    const wanted = sql.join(input.names.map(name => sql`${name}`));
+    const { rows } = await sql<AgentCatalogUsageRow>`
+      SELECT agent_name, reference_name
+      FROM (${catalogUsagePairs({ entity: input.entity, tenant_id: input.tenant_id })}) AS agent_usage
+      WHERE reference_name IN (${wanted})
+      ORDER BY agent_name`.execute(db);
+    return rows;
+  }
+
+  async listAgentNamesUsingSandboxEnvironment(
+    input: ListAgentNamesUsingSandboxEnvironmentInput,
+    transaction?: Transaction<Database>,
+  ): Promise<readonly string[]> {
+    const db = transaction ?? this.#db;
+    const rows = await db
+      .selectFrom('agent')
+      .select('name')
+      .where('tenant_id', '=', input.tenant_id)
+      .where(sql`manifest->'config'->'sandbox'->>'environment_name'`, '=', input.environment_name)
+      .orderBy('name', 'asc')
+      .execute();
+    return rows.map(row => row.name);
+  }
+}

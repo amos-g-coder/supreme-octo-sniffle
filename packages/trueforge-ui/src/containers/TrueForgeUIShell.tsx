@@ -1,0 +1,383 @@
+'use client';
+
+import type {
+  TrueForgeAgentConfig,
+  UseTrueForgeAgentRuntimeOptions,
+} from '@truefoundry/trueforge-assistant-ui-runtime';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { ThinkingOrb } from 'thinking-orbs';
+
+import { AnalyticsProvider } from '../analytics/AnalyticsProvider.js';
+import type { AnalyticsConfig } from '../analytics/types.js';
+import { AgentConfigInstructionsProvider } from '../atoms/draft/AgentConfigInstructionsContext.js';
+import { DraftCatalogProvider } from '../atoms/draft/DraftCatalogProvider.js';
+import { DraftSpecPreferenceBridge } from '../atoms/draft/DraftSpecPreferenceBridge.js';
+import { cn } from '../atoms/lib/cn.js';
+import { IS_CREATE_AGENT_METADATA_KEY, isCreateAgentMetadataValue } from '../atoms/lib/sessionCreateAgent.js';
+import { preloadMonaco } from '../atoms/monacoPreload.js';
+import { CurrentUserProvider, type CurrentUser } from '../contexts/CurrentUserContext.js';
+import { WidgetVisibilityProvider } from '../layouts/WidgetVisibilityContext.js';
+import { HistorySessionSwitchBridge } from '../routing/HistorySessionSwitchBridge.js';
+import { LibrarySessionShareBoot } from '../routing/LibrarySessionShareBoot.js';
+import { RemoteIdRouteBridge } from '../routing/RemoteIdRouteBridge.js';
+import { ResolvedRoutesProvider } from '../routing/ResolvedRoutesContext.js';
+import type { ResolvedRoutes, RoutesConfig } from '../routing/types.js';
+import { CustomActionRenderersProvider, type CustomActionRenderers } from '../server/CustomActionRenderersContext.js';
+import { ServerProvider } from '../server/ServerContext.js';
+import { createSessionListCache, withSessionListCache } from '../server/sessionListCache.js';
+import { DEFAULT_AGENT_CONFIG, ShellModeProvider, useShellMode, type AgentConfig } from '../server/ShellModeContext.js';
+import type { TrueForgeServerConfig } from '../server/TrueForgeServerConfig.js';
+import type { AgentUIServer, CreateSessionRequest } from '../server/types.js';
+import { SlotsProvider, useThemeMode, type SlotOverrides } from '../theme/SlotsProvider.js';
+import type { LayoutProp, ThemeConfig } from '../theme/types.js';
+import { getErrorMessage } from '../utils/getErrorMessage.js';
+import { ToasterProvider } from './ToasterContainer.js';
+import { TrueForgeChatProvider, type TrueForgeChatProviderProps } from './TrueForgeChatProvider.js';
+import { useResolvedServer } from './useResolvedServer.js';
+
+const SidebarLayout = lazy(() => import('../layouts/SidebarLayout.js').then(m => ({ default: m.SidebarLayout })));
+const DrawerLayout = lazy(() => import('../layouts/DrawerLayout.js').then(m => ({ default: m.DrawerLayout })));
+const DockLayout = lazy(() => import('../layouts/DockLayout.js').then(m => ({ default: m.DockLayout })));
+const WidgetLayout = lazy(() => import('../layouts/WidgetLayout.js').then(m => ({ default: m.WidgetLayout })));
+const ShellRouteSync = lazy(() => import('../routing/ShellRouteSync.js').then(m => ({ default: m.ShellRouteSync })));
+
+export type ChatLayout = 'sidebar' | 'drawer' | 'dock' | 'widget';
+
+type RuntimeAdapters = NonNullable<UseTrueForgeAgentRuntimeOptions['adapters']>;
+
+export type TrueForgeUIProps = {
+  server: TrueForgeServerConfig;
+  /** Built-in layout string or a custom layout component. Defaults to `"sidebar"`. */
+  layout?: LayoutProp;
+  overrides?: SlotOverrides;
+  theme?: ThemeConfig;
+  className?: string;
+  initialSessionId?: string;
+  adapters?: RuntimeAdapters;
+  onError?: (error: unknown) => void;
+  /** Host product-analytics sink; SDK never ships a vendor. */
+  analytics?: AnalyticsConfig;
+  /**
+   * Agent / library / composer shell mode.
+   * Defaults to `{ mode: "AgentLibraryWithComposer" }`.
+   */
+  agentConfig?: AgentConfig;
+  /** Open settings on first paint only (host boot with no models configured). */
+  initialSettingsOpen?: boolean;
+  /**
+   * Host UI for pending client-side tools, keyed by tool name.
+   * When a pending tool matches, that component is shown above the composer instead of Ask User.
+   */
+  customActionRenderers?: CustomActionRenderers;
+  /**
+   * Sync shell navigation to the browser URL via react-router (opt-in).
+   * Requires `react-router-dom` in the host. Leave off for dock/widget embeds
+   * and hosts that own their own router. Defaults to `false`.
+   */
+  withRouter?: boolean;
+  /** URL path customization; only honored when `withRouter`. */
+  routes?: RoutesConfig;
+  /** Optional identity rendered by the default `UserAvatar` slot. */
+  currentUser?: CurrentUser;
+};
+
+export type TrueForgeUIShellProps = Omit<TrueForgeUIProps, 'withRouter'> & { resolvedRoutes?: ResolvedRoutes };
+
+function LayoutFallback({ className }: { className?: string }) {
+  return (
+    <div
+      className={className}
+      style={{
+        height: '100%',
+        minHeight: '12rem',
+        background:
+          'linear-gradient(90deg, color-mix(in oklab, var(--secondary-bg) 55%, transparent) 25%, color-mix(in oklab, var(--secondary-bg) 25%, transparent) 50%, color-mix(in oklab, var(--secondary-bg) 55%, transparent) 75%)',
+        backgroundSize: '200% 100%',
+        animation: 'tfy-aui-pulse 1.2s ease-in-out infinite',
+      }}
+      aria-hidden
+    />
+  );
+}
+
+/** Shown while a built-in agent UI server resolves. */
+export function ServerInitLoader({ className }: { className?: string }) {
+  // Outside ThemeProvider (Suspense), useThemeMode falls back to light.
+  const themeMode = useThemeMode();
+  return (
+    <div
+      role="status"
+      aria-label="Loading"
+      aria-live="polite"
+      aria-busy="true"
+      className={cn(
+        'flex h-full min-h-48 w-full flex-1 items-center justify-center bg-primary-bg text-text-secondary',
+        className,
+      )}
+    >
+      <ThinkingOrb
+        state="connecting"
+        speed={1}
+        theme={themeMode}
+        paused={false}
+        aria-hidden
+        size={64}
+        style={{ width: '4.5rem', height: '4.5rem' }}
+      />
+    </div>
+  );
+}
+
+function ServerInitError({ error, className }: { error: unknown; className?: string }) {
+  const message = getErrorMessage(error, 'Failed to initialize server');
+  return (
+    <div
+      role="alert"
+      className={cn(
+        'flex h-full min-h-48 items-center justify-center bg-primary-bg px-6 text-center text-sm text-failure-bg',
+        className,
+      )}
+    >
+      {message}
+    </div>
+  );
+}
+
+function isBuiltInLayout(layout: LayoutProp): layout is ChatLayout {
+  return layout === 'sidebar' || layout === 'drawer' || layout === 'dock' || layout === 'widget';
+}
+
+function BuiltInLayoutView({ layout, className }: { layout: ChatLayout; className?: string }) {
+  switch (layout) {
+    case 'sidebar':
+      return <SidebarLayout className={className} />;
+    case 'drawer':
+      return <DrawerLayout className={className} />;
+    case 'dock':
+      return <DockLayout className={className} />;
+    case 'widget':
+      return <WidgetLayout className={className} />;
+  }
+}
+
+function LayoutChildren({ layout, className }: { layout: LayoutProp; className?: string }) {
+  if (isBuiltInLayout(layout)) {
+    return (
+      <Suspense fallback={<LayoutFallback className={className} />}>
+        <BuiltInLayoutView layout={layout} className={className} />
+      </Suspense>
+    );
+  }
+  const HostLayout = layout;
+  return <HostLayout className={className} />;
+}
+
+function ChatProviderFromShell({
+  children,
+  initialSessionId: hostInitialSessionId,
+  onRemoteIdChange,
+  server,
+  ...providerRest
+}: {
+  children: ReactNode;
+  /** When routing, reports the active thread's remote id up to `ShellRouteSync`. */
+  onRemoteIdChange?: (id: string | undefined) => void;
+} & Omit<TrueForgeChatProviderProps, 'agent' | 'agentName' | 'listSessionsAgentId' | 'children'>) {
+  const { mode, runtimeKey, historyAgentFilter, listSessionsAgentId, pendingSessionId, sessionAccessError } =
+    useShellMode();
+
+  const isCreateAgent = mode.status === 'active' && mode.isMutable && mode.isCreateAgent;
+
+  // Keep one isolated cache per shell, preserved across chat runtime remounts.
+  const [sessionListCache] = useState(createSessionListCache);
+
+  const serverWithCreateIntent = useMemo((): AgentUIServer => {
+    return {
+      ...server,
+      createSession: request => {
+        if (request.agentSpec === undefined) {
+          return server.createSession(request);
+        }
+        const withMetadata: CreateSessionRequest & { metadata: Record<string, string> } = {
+          ...request,
+          metadata: {
+            [IS_CREATE_AGENT_METADATA_KEY]: isCreateAgentMetadataValue(isCreateAgent),
+          },
+        };
+        return server.createSession(withMetadata);
+      },
+    };
+  }, [server, isCreateAgent]);
+
+  const cachedRuntimeServer = useMemo(
+    () => withSessionListCache({ server: serverWithCreateIntent, cache: sessionListCache }),
+    [serverWithCreateIntent, sessionListCache],
+  );
+  const runtimeServer = useMemo<AgentUIServer>(() => {
+    if (historyAgentFilter == null || historyAgentFilter.agentId != null) return cachedRuntimeServer;
+    // Do not expose an unfiltered page under a filter label while its backend id resolves.
+    return { ...cachedRuntimeServer, listSessions: async () => ({ data: [] }) };
+  }, [cachedRuntimeServer, historyAgentFilter]);
+
+  // Freeze draft seed for the life of this runtimeKey so bindMutableAgent (identity /
+  // instructions on shell) does not push a new defaultAgentSpec into the runtime.
+  const draftDefaultAgentSpec = useMemo(() => {
+    if (mode.status === 'active' && mode.isMutable) {
+      return mode.agentSpec ?? { model: { name: 'openai-main/gpt-4.1' } };
+    }
+    return { model: { name: 'openai-main/gpt-4.1' } };
+    // runtimeKey is the remount boundary for mutable chats.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on runtimeKey only
+  }, [runtimeKey]);
+
+  const agent: TrueForgeAgentConfig = useMemo(() => {
+    // idle uses a placeholder draft so layout chrome (useAui) still mounts;
+    // layouts render an empty CTA instead of the thread.
+    if (mode.status === 'idle') {
+      return {
+        mode: 'draft',
+        defaultAgentSpec: { model: { name: 'openai-main/gpt-4.1' } },
+      };
+    }
+    // Access failures keep a pending id for the URL but must not bind named runtime to it.
+    if (sessionAccessError != null) {
+      return {
+        mode: 'draft',
+        defaultAgentSpec: draftDefaultAgentSpec,
+      };
+    }
+    // Runtime still uses named|draft; shell mutability maps onto that adapter.
+    if (!mode.isMutable) {
+      const agentName = mode.agentName ?? mode.agentId ?? pendingSessionId;
+      if (agentName == null) {
+        // Active immutable without identity should not happen; keep chrome mounted.
+        return {
+          mode: 'draft',
+          defaultAgentSpec: { model: { name: 'openai-main/gpt-4.1' } },
+        };
+      }
+      return { mode: 'named', agentName };
+    }
+    return {
+      mode: 'draft',
+      defaultAgentSpec: draftDefaultAgentSpec,
+    };
+  }, [mode, draftDefaultAgentSpec, pendingSessionId, sessionAccessError]);
+
+  return (
+    <DraftCatalogProvider>
+      <TrueForgeChatProvider
+        key={runtimeKey}
+        {...providerRest}
+        server={runtimeServer}
+        agent={agent}
+        listSessionsAgentId={listSessionsAgentId}
+        initialSessionId={sessionAccessError != null ? undefined : (pendingSessionId ?? hostInitialSessionId)}
+      >
+        <AgentConfigInstructionsProvider>
+          <DraftSpecPreferenceBridge />
+          <HistorySessionSwitchBridge />
+          {onRemoteIdChange != null ? <RemoteIdRouteBridge onRemoteIdChange={onRemoteIdChange} /> : null}
+          {children}
+        </AgentConfigInstructionsProvider>
+      </TrueForgeChatProvider>
+    </DraftCatalogProvider>
+  );
+}
+
+/** Internal shell. `resolvedRoutes` present iff mounted under `TrueForgeUIWithRouter`. */
+export function TrueForgeUIShell(props: TrueForgeUIShellProps) {
+  const {
+    layout = 'sidebar',
+    overrides,
+    theme,
+    className,
+    agentConfig = DEFAULT_AGENT_CONFIG,
+    initialSettingsOpen = false,
+    server: serverConfig,
+    onError,
+    analytics,
+    customActionRenderers,
+    currentUser,
+    resolvedRoutes,
+    routes: _routes,
+    ...providerRest
+  } = props;
+
+  const resolved = useResolvedServer(serverConfig, onError);
+  const [activeRemoteId, setActiveRemoteId] = useState<string | undefined>(undefined);
+  const handleRemoteIdChange = useCallback((id: string | undefined) => setActiveRemoteId(id), []);
+
+  // Warm Monaco while the shell boots so tool request/response cards paint faster.
+  useEffect(() => {
+    void preloadMonaco();
+  }, []);
+
+  if (resolved.status === 'loading') {
+    return (
+      <SlotsProvider overrides={overrides} theme={theme}>
+        <ServerInitLoader className={className} />
+      </SlotsProvider>
+    );
+  }
+
+  if (resolved.status === 'error') {
+    return (
+      <SlotsProvider overrides={overrides} theme={theme}>
+        <ServerInitError error={resolved.error} className={className} />
+      </SlotsProvider>
+    );
+  }
+
+  const server = resolved.server;
+  const layoutTree = <LayoutChildren layout={layout} className={className} />;
+
+  // Outer toaster for sessions browser / chrome; nested ToasterProvider inside
+  // TrueForgeChatProvider stays for hosts that mount chat alone. Analytics wraps
+  // the same tree so chrome + chat share one sink.
+  const shellTree = (
+    <AnalyticsProvider track={analytics?.track}>
+      <ToasterProvider>
+        <ShellModeProvider agentConfig={agentConfig} initialSettingsOpen={initialSettingsOpen}>
+          <LibrarySessionShareBoot />
+          {resolvedRoutes != null ? (
+            <Suspense fallback={null}>
+              <ShellRouteSync
+                routes={resolvedRoutes}
+                activeRemoteId={activeRemoteId}
+                initialSettingsOpen={initialSettingsOpen}
+              />
+            </Suspense>
+          ) : null}
+          <ChatProviderFromShell
+            server={server}
+            onError={onError}
+            onRemoteIdChange={resolvedRoutes != null ? handleRemoteIdChange : undefined}
+            {...providerRest}
+          >
+            {layoutTree}
+          </ChatProviderFromShell>
+        </ShellModeProvider>
+      </ToasterProvider>
+    </AnalyticsProvider>
+  );
+  // Widget visibility provider is used to control the visibility of the widget with isolated state
+  const visibilityTree =
+    layout === 'widget' ? <WidgetVisibilityProvider>{shellTree}</WidgetVisibilityProvider> : shellTree;
+
+  return (
+    <SlotsProvider overrides={overrides} theme={theme}>
+      <CurrentUserProvider currentUser={currentUser}>
+        <CustomActionRenderersProvider renderers={customActionRenderers}>
+          <ServerProvider server={server}>
+            {resolvedRoutes != null ? (
+              <ResolvedRoutesProvider routes={resolvedRoutes}>{visibilityTree}</ResolvedRoutesProvider>
+            ) : (
+              visibilityTree
+            )}
+          </ServerProvider>
+        </CustomActionRenderersProvider>
+      </CurrentUserProvider>
+    </SlotsProvider>
+  );
+}

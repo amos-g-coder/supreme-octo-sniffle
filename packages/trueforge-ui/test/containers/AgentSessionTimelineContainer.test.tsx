@@ -1,0 +1,785 @@
+// @vitest-environment jsdom
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+
+import { AgentSessionTimelineContainer } from '@/containers/AgentSessionTimelineContainer.js';
+import { ServerProvider } from '@/server/ServerContext.js';
+import type { SessionEventItem } from '@/server/types.js';
+import { SlotsProvider } from '@/theme/SlotsProvider.js';
+import { createMockAgentUIServer } from '../server/mockServer.js';
+
+type TurnDoneEvent = Extract<SessionEventItem['event'], { type: 'turn.done' }>;
+
+const events: SessionEventItem[] = [
+  {
+    turnId: 'turn-1',
+    event: {
+      type: 'turn.created',
+      id: 'c1',
+      turnId: 'turn-1',
+      previousTurnId: null,
+      input: [{ type: 'user.message', content: 'hello' }],
+      state: { status: 'running' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      threadId: null,
+    },
+  },
+  {
+    turnId: 'turn-1',
+    event: {
+      type: 'turn.done',
+      id: 'd1',
+      state: { status: 'done', completedAt: '2026-01-01T00:00:02.000Z', output: null, requiredActions: [] },
+      createdAt: '2026-01-01T00:00:02.000Z',
+      threadId: null,
+    },
+  },
+];
+
+const doneState: TurnDoneEvent['state'] = {
+  status: 'done',
+  completedAt: '2026-01-01T00:00:02.000Z',
+  output: null,
+  requiredActions: [],
+};
+
+const groupingEvents: SessionEventItem[] = [
+  {
+    turnId: 'turn-1',
+    event: {
+      type: 'turn.created',
+      id: 'turn-1-created',
+      turnId: 'turn-1',
+      previousTurnId: null,
+      input: [{ type: 'user.message', content: 'initial request' }],
+      state: { status: 'running' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      threadId: null,
+    },
+  },
+  {
+    turnId: 'turn-1',
+    event: {
+      type: 'model.message',
+      id: 'turn-1-model',
+      threadId: 'main',
+      content: 'turn one response',
+      createdAt: '2026-01-01T00:00:01.000Z',
+    },
+  },
+  {
+    turnId: 'turn-1',
+    event: { type: 'turn.done', id: 'turn-1-done', state: doneState, createdAt: doneState.completedAt },
+  },
+  {
+    turnId: 'turn-2',
+    event: {
+      type: 'turn.created',
+      id: 'turn-2-created',
+      turnId: 'turn-2',
+      previousTurnId: 'turn-1',
+      input: [{ type: 'user.tool_response', threadId: 'main', toolCallId: 'question-1', content: 'continue' }],
+      state: { status: 'running' },
+      createdAt: '2026-01-01T00:00:03.000Z',
+      threadId: null,
+    },
+  },
+  {
+    turnId: 'turn-2',
+    event: {
+      type: 'model.message',
+      id: 'turn-2-model',
+      threadId: 'main',
+      content: 'turn two response',
+      createdAt: '2026-01-01T00:00:04.000Z',
+    },
+  },
+  {
+    turnId: 'turn-2',
+    event: {
+      type: 'turn.done',
+      id: 'turn-2-done',
+      state: { ...doneState, completedAt: '2026-01-01T00:00:05.000Z' },
+      createdAt: '2026-01-01T00:00:05.000Z',
+    },
+  },
+  {
+    turnId: 'turn-3',
+    event: {
+      type: 'turn.created',
+      id: 'turn-3-created',
+      turnId: 'turn-3',
+      previousTurnId: 'turn-2',
+      input: [{ type: 'user.tool_response', threadId: 'main', toolCallId: 'question-2', content: 'stop' }],
+      state: { status: 'running' },
+      createdAt: '2026-01-01T00:00:06.000Z',
+      threadId: null,
+    },
+  },
+  {
+    turnId: 'turn-3',
+    event: {
+      type: 'turn.done',
+      id: 'turn-3-done',
+      state: {
+        status: 'cancelled',
+        reason: 'client-cancelled',
+        completedAt: '2026-01-01T00:00:07.000Z',
+      },
+      createdAt: '2026-01-01T00:00:07.000Z',
+    },
+  },
+  {
+    turnId: 'turn-4',
+    event: {
+      type: 'turn.created',
+      id: 'turn-4-created',
+      turnId: 'turn-4',
+      previousTurnId: 'turn-3',
+      input: [{ type: 'user.message', content: 'retry' }],
+      state: { status: 'running' },
+      createdAt: '2026-01-01T00:00:08.000Z',
+      threadId: null,
+    },
+  },
+  {
+    turnId: 'turn-4',
+    event: {
+      type: 'turn.done',
+      id: 'turn-4-done',
+      state: { status: 'error', message: 'model failed', completedAt: '2026-01-01T00:00:09.000Z' },
+      createdAt: '2026-01-01T00:00:09.000Z',
+    },
+  },
+];
+
+describe('AgentSessionTimelineContainer', () => {
+  it('passes grouped turns to the timeline slot and scrolls on select', async () => {
+    const scrollIntoView = vi.fn();
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+
+    const { container } = render(
+      <SlotsProvider
+        overrides={{
+          AgentSessionEventTimeline: ({ turns, onSelectTurn }) => (
+            <button type="button" onClick={() => onSelectTurn?.(0)}>
+              {`timeline turns=${turns.length}`}
+            </button>
+          ),
+        }}
+      >
+        <ServerProvider server={createMockAgentUIServer()}>
+          <AgentSessionTimelineContainer sessionId="sess-1" events={events} />
+        </ServerProvider>
+      </SlotsProvider>,
+    );
+
+    expect(await screen.findByText('timeline turns=1')).toBeInTheDocument();
+    expect(await screen.findByText('Turn 1')).toBeInTheDocument();
+    expect(screen.getByText('Turn')).toBeInTheDocument();
+    expect(screen.getByText('Duration')).toBeInTheDocument();
+    expect(await screen.findAllByRole('button', { name: 'Copy' })).not.toHaveLength(0);
+    expect(container.querySelector('[data-slot="agent-session-scroll"]')).toHaveClass('overflow-y-auto');
+    expect(container.querySelector('[data-slot="agent-session-metrics-sticky"]')).toHaveClass(
+      'sticky',
+      'top-0',
+      'bg-primary-bg',
+    );
+    expect(container.querySelector('[data-slot="aui_thread-viewport"]')).toHaveClass('overflow-visible');
+    fireEvent.click(screen.getByRole('button', { name: 'timeline turns=1' }));
+    await waitFor(() => {
+      expect(scrollIntoView).toHaveBeenCalled();
+    });
+  });
+
+  it('shows the empty state when the only turn is still running', async () => {
+    render(
+      <SlotsProvider overrides={{ AgentSessionEventTimeline: () => null }}>
+        <ServerProvider
+          server={createMockAgentUIServer({
+            listTurns: async () => ({
+              data: [
+                {
+                  id: 'turn-running',
+                  sessionId: 'sess-1',
+                  state: { status: 'running' as const },
+                  createdAt: '2026-01-01T00:00:00.000Z',
+                  input: [{ type: 'user.message' as const, content: 'in flight' }],
+                },
+              ],
+            }),
+            getTurn: async () => ({
+              id: 'turn-running',
+              sessionId: 'sess-1',
+              state: { status: 'running' as const },
+              createdAt: '2026-01-01T00:00:00.000Z',
+              input: [{ type: 'user.message' as const, content: 'in flight' }],
+            }),
+            listTurnEvents: async () => ({
+              data: [
+                {
+                  type: 'model.message' as const,
+                  id: 'm1',
+                  threadId: 'main',
+                  content: 'partial assistant text',
+                  createdAt: '2026-01-01T00:00:01.000Z',
+                },
+              ],
+            }),
+          })}
+        >
+          <AgentSessionTimelineContainer sessionId="sess-1" events={[]} />
+        </ServerProvider>
+      </SlotsProvider>,
+    );
+
+    expect(await screen.findByText('This session has no messages yet.')).toBeInTheDocument();
+    expect(screen.queryByText('in flight')).not.toBeInTheDocument();
+    expect(screen.queryByText('partial assistant text')).not.toBeInTheDocument();
+  });
+
+  it('keeps responses in their backend turns and renders terminal failures', async () => {
+    let timelineTitles: string[] = [];
+    render(
+      <SlotsProvider
+        overrides={{
+          AgentSessionEventTimeline: ({ segments }) => {
+            timelineTitles = segments.map(segment => segment.title);
+            return null;
+          },
+        }}
+      >
+        <ServerProvider server={createMockAgentUIServer()}>
+          <AgentSessionTimelineContainer sessionId="sess-1" events={groupingEvents} />
+        </ServerProvider>
+      </SlotsProvider>,
+    );
+
+    const turn1 = (await screen.findByText('Turn 1')).closest('section');
+    const turn2 = screen.getByText('Turn 2').closest('section');
+    const turn3 = screen.getByText('Turn 3').closest('section');
+    const turn4 = screen.getByText('Turn 4').closest('section');
+
+    expect(turn1).not.toBeNull();
+    expect(turn2).not.toBeNull();
+    expect(turn3).not.toBeNull();
+    expect(turn4).not.toBeNull();
+    if (turn1 == null || turn2 == null || turn3 == null || turn4 == null) {
+      throw new Error('Expected every backend turn to render a section');
+    }
+    expect(within(turn1).getByText('turn one response')).toBeInTheDocument();
+    expect(within(turn1).queryByText('turn two response')).not.toBeInTheDocument();
+    expect(within(turn2).getByText('continue')).toBeInTheDocument();
+    expect(within(turn2).getByText('turn two response')).toBeInTheDocument();
+    expect(within(turn3).getByText('client-cancelled')).toBeInTheDocument();
+    expect(within(turn4).getByText('model failed')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(timelineTitles).toContain('turn.cancelled');
+      expect(timelineTitles).toContain('turn.error');
+    });
+  });
+
+  it('disables sandbox artifact downloads in session turns', async () => {
+    const artifactEvents: SessionEventItem[] = [
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.created',
+          id: 'c1',
+          turnId: 'turn-1',
+          previousTurnId: null,
+          input: [{ type: 'user.message', content: 'generate a file' }],
+          state: { status: 'running' },
+          createdAt: '2026-01-01T00:00:00.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'model.message',
+          id: 'm1',
+          threadId: 'main',
+          content: ['Files ready:', '', '```sandbox_artifacts', '[report.txt](/tmp/report.txt)', '```'].join('\n'),
+          createdAt: '2026-01-01T00:00:01.000Z',
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.done',
+          id: 'd1',
+          state: doneState,
+          createdAt: doneState.completedAt,
+        },
+      },
+    ];
+
+    render(
+      <SlotsProvider overrides={{ AgentSessionEventTimeline: () => null }}>
+        <ServerProvider server={createMockAgentUIServer()}>
+          <AgentSessionTimelineContainer sessionId="sess-1" events={artifactEvents} />
+        </ServerProvider>
+      </SlotsProvider>,
+    );
+
+    expect(await screen.findByTestId('aui-sandbox-artifacts')).toBeInTheDocument();
+    expect(screen.getByText('report.txt')).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Download /)).not.toBeInTheDocument();
+    expect(screen.queryAllByRole('link')).toHaveLength(0);
+
+    fireEvent.mouseEnter(screen.getByText('report.txt').parentElement ?? screen.getByText('report.txt'));
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Download File is not available in read-only mode');
+  });
+
+  it('hides tool approval Allow/Deny actions in session turns', async () => {
+    const approvalEvents: SessionEventItem[] = [
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.created',
+          id: 'c1',
+          turnId: 'turn-1',
+          previousTurnId: null,
+          input: [{ type: 'user.message', content: 'run tool' }],
+          state: { status: 'running' },
+          createdAt: '2026-01-01T00:00:00.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'model.message',
+          id: 'm1',
+          threadId: 'main',
+          content: 'calling tool',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          toolCalls: [
+            {
+              id: 'approval-1',
+              type: 'function',
+              function: { name: 'bash', arguments: '{}' },
+              toolInfo: {
+                type: 'mcp',
+                name: 'bash',
+                serverId: 'bash-server',
+                serverName: 'bash',
+              },
+            },
+          ],
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'tool.approval_required',
+          id: 'approval-event',
+          threadId: 'main',
+          createdAt: '2026-01-01T00:00:01.500Z',
+          toolCalls: [{ id: 'approval-1', sourceEventId: 'm1' }],
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.done',
+          id: 'd1',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:02.000Z',
+            output: null,
+            requiredActions: [
+              {
+                type: 'tool.approval_required',
+                id: 'approval-event',
+                threadId: 'main',
+                createdAt: '2026-01-01T00:00:01.500Z',
+                toolCalls: [{ id: 'approval-1', sourceEventId: 'm1' }],
+              },
+            ],
+          },
+          createdAt: '2026-01-01T00:00:02.000Z',
+          threadId: null,
+        },
+      },
+    ];
+
+    render(
+      <SlotsProvider overrides={{ AgentSessionEventTimeline: () => null }}>
+        <ServerProvider server={createMockAgentUIServer()}>
+          <AgentSessionTimelineContainer sessionId="sess-1" events={approvalEvents} />
+        </ServerProvider>
+      </SlotsProvider>,
+    );
+
+    expect(await screen.findByText('Tool Approval Required for')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Allow' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Deny' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Awaiting Response/)).not.toBeInTheDocument();
+  });
+
+  it('renders unhandled ask_user_question prompt with Unanswered badge and disabled inputs in replay', async () => {
+    const askUserEvents: SessionEventItem[] = [
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.created',
+          id: 'c1',
+          turnId: 'turn-1',
+          previousTurnId: null,
+          input: [{ type: 'user.message', content: 'ask me something' }],
+          state: { status: 'running' },
+          createdAt: '2026-01-01T00:00:00.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'model.message',
+          id: 'm1',
+          threadId: 'main',
+          content: '',
+          createdAt: '2026-01-01T00:00:01.000Z',
+          toolCalls: [
+            {
+              id: 'call-ask-1',
+              type: 'function',
+              function: {
+                name: 'ask_user_question',
+                arguments: JSON.stringify({
+                  question: 'Which environment?',
+                  options: ['staging', 'production'],
+                }),
+              },
+            },
+          ],
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'tool.response_required',
+          id: 'req-ask-1',
+          threadId: 'main',
+          createdAt: '2026-01-01T00:00:01.500Z',
+          toolCalls: [{ id: 'call-ask-1', sourceEventId: 'm1' }],
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.done',
+          id: 'd1',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:02.000Z',
+            output: null,
+            requiredActions: [
+              {
+                type: 'tool.response_required',
+                id: 'req-ask-1',
+                threadId: 'main',
+                createdAt: '2026-01-01T00:00:01.500Z',
+                toolCalls: [{ id: 'call-ask-1', sourceEventId: 'm1' }],
+              },
+            ],
+          },
+          createdAt: '2026-01-01T00:00:02.000Z',
+          threadId: null,
+        },
+      },
+    ];
+
+    render(
+      <SlotsProvider overrides={{ AgentSessionEventTimeline: () => null }}>
+        <ServerProvider server={createMockAgentUIServer()}>
+          <AgentSessionTimelineContainer sessionId="sess-1" events={askUserEvents} />
+        </ServerProvider>
+      </SlotsProvider>,
+    );
+
+    expect(await screen.findByText('Which environment?')).toBeInTheDocument();
+    expect(screen.getByText('Unanswered')).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: 'staging' })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: 'production' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Submit' })).not.toBeInTheDocument();
+  });
+
+  it('renders MCP Auth Required prompt with disabled Connect button in replay', async () => {
+    const mcpAuthEvents: SessionEventItem[] = [
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.created',
+          id: 'c1',
+          turnId: 'turn-1',
+          previousTurnId: null,
+          input: [{ type: 'user.message', content: 'fetch external data' }],
+          state: { status: 'running' },
+          createdAt: '2026-01-01T00:00:00.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.done',
+          id: 'd1',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:02.000Z',
+            output: null,
+            requiredActions: [
+              {
+                type: 'mcp.auth_required',
+                id: 'mcp-req-1',
+                threadId: 'main',
+                createdAt: '2026-01-01T00:00:01.500Z',
+                mcpServers: [
+                  {
+                    id: 'github-server',
+                    name: 'GitHub MCP',
+                    authUrl: 'https://auth.github.com',
+                  },
+                ],
+              },
+            ],
+          },
+          createdAt: '2026-01-01T00:00:02.000Z',
+          threadId: null,
+        },
+      },
+    ];
+
+    render(
+      <SlotsProvider overrides={{ AgentSessionEventTimeline: () => null }}>
+        <ServerProvider server={createMockAgentUIServer()}>
+          <AgentSessionTimelineContainer sessionId="sess-1" events={mcpAuthEvents} />
+        </ServerProvider>
+      </SlotsProvider>,
+    );
+
+    expect(await screen.findByText('MCP Authentication Required')).toBeInTheDocument();
+    expect(screen.getByText('GitHub MCP')).toBeInTheDocument();
+    const connectButton = screen.getByRole('button', { name: /Connect/ });
+    expect(connectButton).toBeInTheDocument();
+    expect(connectButton).toBeDisabled();
+  });
+
+  it('renders continuation turn header and input summary for user.mcp_auth_continue', async () => {
+    const continueEvents: SessionEventItem[] = [
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.created',
+          id: 'c1',
+          turnId: 'turn-1',
+          previousTurnId: null,
+          input: [{ type: 'user.message', content: 'fetch external data' }],
+          state: { status: 'running' },
+          createdAt: '2026-01-01T00:00:00.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.done',
+          id: 'd1',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:02.000Z',
+            output: null,
+            requiredActions: [
+              {
+                type: 'mcp.auth_required',
+                id: 'mcp-req-1',
+                threadId: 'main',
+                createdAt: '2026-01-01T00:00:01.500Z',
+                mcpServers: [
+                  {
+                    id: 'github-server',
+                    name: 'GitHub MCP',
+                    authUrl: 'https://auth.github.com',
+                  },
+                ],
+              },
+            ],
+          },
+          createdAt: '2026-01-01T00:00:02.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-2',
+        event: {
+          type: 'turn.created',
+          id: 'c2',
+          turnId: 'turn-2',
+          previousTurnId: 'turn-1',
+          input: [{ type: 'user.mcp_auth_continue' }],
+          state: { status: 'running' },
+          createdAt: '2026-01-01T00:00:03.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-2',
+        event: {
+          type: 'model.message',
+          id: 'm2',
+          threadId: 'main',
+          content: 'resumed after auth',
+          createdAt: '2026-01-01T00:00:04.000Z',
+        },
+      },
+      {
+        turnId: 'turn-2',
+        event: {
+          type: 'turn.done',
+          id: 'd2',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:05.000Z',
+            output: null,
+            requiredActions: [],
+          },
+          createdAt: '2026-01-01T00:00:05.000Z',
+          threadId: null,
+        },
+      },
+    ];
+
+    render(
+      <SlotsProvider overrides={{ AgentSessionEventTimeline: () => null }}>
+        <ServerProvider server={createMockAgentUIServer()}>
+          <AgentSessionTimelineContainer sessionId="sess-1" events={continueEvents} />
+        </ServerProvider>
+      </SlotsProvider>,
+    );
+
+    expect(await screen.findByText('Turn 1')).toBeInTheDocument();
+    expect(screen.getByText('Turn 2')).toBeInTheDocument();
+    expect(screen.getByText('MCP authorization completed')).toBeInTheDocument();
+    expect(screen.getByText('resumed after auth')).toBeInTheDocument();
+  });
+
+  it('splits empty-input MCP auth resume into Turn 2 with auth widget on Turn 1', async () => {
+    const emptyInputResumeEvents: SessionEventItem[] = [
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.created',
+          id: 'c1',
+          turnId: 'turn-1',
+          previousTurnId: null,
+          input: [{ type: 'user.message', content: 'Hello' }],
+          state: { status: 'running' },
+          createdAt: '2026-01-01T00:00:00.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'mcp.auth_required',
+          id: 'mcp-req-1',
+          threadId: 'main',
+          createdAt: '2026-01-01T00:00:01.500Z',
+          mcpServers: [
+            {
+              id: 'linear',
+              name: 'linear',
+              authUrl: 'https://mcp.linear.app/authorize',
+            },
+          ],
+        },
+      },
+      {
+        turnId: 'turn-1',
+        event: {
+          type: 'turn.done',
+          id: 'd1',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:02.000Z',
+            output: null,
+            requiredActions: [
+              {
+                type: 'mcp.auth_required',
+                id: 'mcp-req-1',
+                threadId: 'main',
+                createdAt: '2026-01-01T00:00:01.500Z',
+                mcpServers: [
+                  {
+                    id: 'linear',
+                    name: 'linear',
+                    authUrl: 'https://mcp.linear.app/authorize',
+                  },
+                ],
+              },
+            ],
+          },
+          createdAt: '2026-01-01T00:00:02.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-2',
+        event: {
+          type: 'turn.created',
+          id: 'c2',
+          turnId: 'turn-2',
+          previousTurnId: 'turn-1',
+          state: { status: 'running' },
+          createdAt: '2026-01-01T00:00:03.000Z',
+          threadId: null,
+        },
+      },
+      {
+        turnId: 'turn-2',
+        event: {
+          type: 'model.message',
+          id: 'm2',
+          threadId: 'main',
+          content: 'Hello! How can I help you today?',
+          createdAt: '2026-01-01T00:00:04.000Z',
+        },
+      },
+      {
+        turnId: 'turn-2',
+        event: {
+          type: 'turn.done',
+          id: 'd2',
+          state: {
+            status: 'done',
+            completedAt: '2026-01-01T00:00:05.000Z',
+            output: null,
+            requiredActions: [],
+          },
+          createdAt: '2026-01-01T00:00:05.000Z',
+          threadId: null,
+        },
+      },
+    ];
+
+    render(
+      <SlotsProvider overrides={{ AgentSessionEventTimeline: () => null }}>
+        <ServerProvider server={createMockAgentUIServer()}>
+          <AgentSessionTimelineContainer sessionId="sess-1" events={emptyInputResumeEvents} />
+        </ServerProvider>
+      </SlotsProvider>,
+    );
+
+    expect(await screen.findByText('Turn 1')).toBeInTheDocument();
+    expect(screen.getByText('Turn 2')).toBeInTheDocument();
+    expect(screen.getByText('MCP Authentication Required')).toBeInTheDocument();
+    expect(screen.getByText('linear')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Connect/ })).toBeDisabled();
+    expect(screen.getByText('MCP authorization completed')).toBeInTheDocument();
+    expect(screen.getByText('Hello! How can I help you today?')).toBeInTheDocument();
+  });
+});
